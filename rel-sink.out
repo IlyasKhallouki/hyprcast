@@ -1,0 +1,4 @@
+[mock-sink] MPEG-TS output: file rel.ts
+[mock-sink] RTP listening on 0.0.0.0:19946/udp
+[mock-sink] RTP total: no datagrams received
+[mock-sink] ERROR: could not connect to 127.0.0.1:7236 within 22.0s: [Errno 111] Connection refused

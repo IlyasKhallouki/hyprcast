@@ -1,0 +1,45 @@
+#!/bin/sh
+# hyprcast launcher.
+#
+# Runs the in-tree control plane without installing anything: it resolves the
+# repository from its own location (following symlinks, so this can live in
+# ~/.local/bin/hyprcast as a symlink) and puts python/ on PYTHONPATH.
+#
+#   ln -sf "$PWD/packaging/hyprcast" ~/.local/bin/hyprcast
+#
+# Override the engine binary with HYPRCAST_ENGINE if it is not in engine/build.
+
+set -eu
+
+self=$0
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case $link in
+        /*) self=$link ;;
+        *)  self=$(dirname "$self")/$link ;;
+    esac
+done
+root=$(CDPATH= cd -- "$(dirname -- "$self")/.." && pwd -P)
+
+if [ ! -d "$root/python/hyprcast" ]; then
+    echo "hyprcast: cannot find $root/python/hyprcast" >&2
+    exit 1
+fi
+
+python=${HYPRCAST_PYTHON:-python3}
+command -v "$python" >/dev/null 2>&1 || {
+    echo "hyprcast: $python not found" >&2
+    exit 1
+}
+
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR
+
+# The engine asserts the iHD driver; i965 misreports RGB32 encode on Gen9.5.
+: "${LIBVA_DRIVER_NAME:=iHD}"
+export LIBVA_DRIVER_NAME
+
+PYTHONPATH="$root/python${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+
+exec "$python" -m hyprcast "$@"

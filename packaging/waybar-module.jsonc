@@ -1,0 +1,41 @@
+// hyprcast waybar module -- paste unedited.
+//
+// 1. add "custom/hyprcast" to one of modules-left / -center / -right
+// 2. paste the block below at the top level of ~/.config/waybar/config.jsonc
+// 3. paste the CSS at the bottom of ~/.config/waybar/style.css
+//
+// The module STREAMS: no "interval", no "signal". `hyprcast waybar` prints one
+// JSON object per line and flushes each one, so the bar updates the instant the
+// session state changes and the tooltip's timer ticks once a second. Adding an
+// "interval" would restart the process every N seconds and break that.
+
+  "custom/hyprcast": {
+    "exec": "hyprcast waybar",
+    "return-type": "json",
+    "restart-interval": 5,
+    "tooltip": true,
+    "format": "{icon} {}",
+    // Plain geometric shapes so the module works without a nerd font.
+    "format-icons": {
+      "idle": "○",
+      "discovering": "◌",
+      "connecting": "◔",
+      "casting": "●",
+      "error": "✕"
+    },
+    "on-click": "hyprcast ctl stop",
+    "on-click-right": "hyprcast ctl mute",
+    "on-scroll-up": "hyprcast ctl volume 100",
+    "on-scroll-down": "hyprcast ctl volume 50"
+  },
+
+/* style.css
+
+#custom-hyprcast              { padding: 0 10px; }
+#custom-hyprcast.idle         { color: @text; opacity: 0.55; }
+#custom-hyprcast.discovering,
+#custom-hyprcast.connecting   { color: #f9e2af; }
+#custom-hyprcast.casting      { color: #a6e3a1; }
+#custom-hyprcast.error        { color: #f38ba8; }
+
+*/

@@ -5,6 +5,7 @@ project('hyprcast-engine', 'c',
 cc = meson.get_compiler('c')
 
 deps = [
+  dependency('threads'),
   dependency('wayland-client'),
   dependency('gbm'),
   dependency('libdrm'),
@@ -79,4 +80,58 @@ if bench_ready
     install: false)
 else
   message('Milestone 1B sources incomplete — hyprcast-bench target skipped.')
+endif
+
+# ---------------------------------------------------------------------------
+# hyprcast-engine — the shipping binary. Same media path as the bench, plus the
+# CFR pacer, the muxer, the audio leg and the fd-3 JSON control channel.
+# capture/dmabuf/vaapi/encode/hist are shared verbatim with hyprcast-bench.
+# ---------------------------------------------------------------------------
+engine_names = ['main', 'control', 'capture', 'dmabuf', 'vaapi', 'encode',
+                'hist', 'mux', 'audio']
+engine_src = []
+engine_missing = []
+foreach n : engine_names
+  if fs.exists('src' / n + '.c')
+    engine_src += files('src' / n + '.c')
+  else
+    engine_missing += n + '.c'
+  endif
+endforeach
+
+if engine_missing.length() == 0
+  executable('hyprcast-engine',
+    engine_src + proto,
+    include_directories: [proto_inc, include_directories('src')],
+    dependencies: deps + [dependency('threads')],
+    install: true)
+else
+  message('hyprcast-engine target skipped — missing: ' + ', '.join(engine_missing))
+endif
+
+# ---------------------------------------------------------------------------
+# hyprcast-muxtest (Milestone 2) — the same native path, but out on the wire
+# through hc_mux (rtp_mpegts) with hc_audio's AAC alongside it. Point it at
+# tools/mock-sink.py and check the result with tools/assert-ts.py.
+# ---------------------------------------------------------------------------
+mux_names = ['muxtest', 'mux', 'audio', 'capture', 'dmabuf', 'vaapi', 'encode',
+             'hist']
+mux_src = []
+mux_ready = true
+foreach n : mux_names
+  if fs.exists('src' / n + '.c')
+    mux_src += files('src' / n + '.c')
+  else
+    mux_ready = false
+  endif
+endforeach
+
+if mux_ready
+  executable('hyprcast-muxtest',
+    mux_src + proto,
+    include_directories: [proto_inc, include_directories('src')],
+    dependencies: deps,
+    install: false)
+else
+  message('Milestone 2 sources incomplete — hyprcast-muxtest target skipped.')
 endif

@@ -1,0 +1,48 @@
+[Unit]
+# systemd --user unit for the hyprcast control plane.
+#
+#   mkdir -p ~/.config/systemd/user
+#   ln -sf "$PWD/packaging/hyprcast.service" ~/.config/systemd/user/hyprcast.service
+#   systemctl --user daemon-reload
+#   systemctl --user start hyprcast
+#
+# It starts IDLE: the control socket comes up, nothing is captured, and
+# `hyprcast ctl start` (or the waybar module) drives it from there. That is
+# deliberate -- a unit that grabs the screen on login is not what anyone wants.
+#
+# Override the peer and the wire mode without editing this file:
+#   systemctl --user edit hyprcast
+#   [Service]
+#   Environment=HYPRCAST_ARGS=--peer 192.168.168.42:19900 --second-screen
+
+Description=hyprcast control plane
+Documentation=file:%h/projects/hyprcast/STATUS.md
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+Requires=pipewire.service
+
+[Service]
+Type=simple
+Environment=HYPRCAST_ARGS=
+Environment=LIBVA_DRIVER_NAME=iHD
+ExecStart=/bin/sh -c 'exec %h/projects/hyprcast/packaging/hyprcast cast --idle $HYPRCAST_ARGS'
+ExecStop=/bin/sh -c '%h/projects/hyprcast/packaging/hyprcast ctl stop || true'
+
+# A cast that dies must not leave a phantom headless monitor behind. The Python
+# teardown runs on SIGTERM; give it room before systemd escalates to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=3
+
+# It talks to the compositor, PipeWire and a render node -- nothing else.
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t
+DevicePolicy=closed
+DeviceAllow=/dev/dri rw
+
+[Install]
+WantedBy=graphical-session.target

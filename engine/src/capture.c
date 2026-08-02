@@ -642,6 +642,31 @@ int hc_capture_submit(struct hc_capture *c, struct hc_inflight **token)
         return -1;
     }
 
+    /*
+     * CRASHES THE COMPOSITOR IF OMITTED. Verified on Hyprland 0.55.4:
+     *
+     *   #5 Screenshare::CScreenshareFrame::transform() const
+     *   #6 CImageCopyCaptureFrame::CImageCopyCaptureFrame(...)
+     *   #12 libwayland-server  <- dispatching our create_frame
+     *
+     * CScreenshareFrame::transform() does
+     *     case SHARE_MONITOR: return m_session->monitor()->m_transform;
+     * with no null check (reference/hyprland/hypr_ScreenshareFrame.cpp:487-494),
+     * and the frame constructor reaches it via nextFrame() at
+     * hypr_ImageCopyCapture.cpp:355. Once the captured output is gone,
+     * monitor() is null and create_frame aborts the whole compositor -- taking
+     * every client with it. Reproduced 2026-08-02 16:09:30 (14.6 MB coredump).
+     *
+     * That is a Hyprland bug: a compositor must never abort on client input.
+     * But we must not be the client that trips it.
+     */
+    if (c->output_gone) {
+        fprintf(stderr, "hc_capture_submit: captured wl_output is gone; refusing "
+                        "to create a frame (it would abort the compositor)\n");
+        c->stopped = true;
+        return -1;
+    }
+
     int idx = -1;
     struct hc_inflight *fl = infl_alloc(c, &idx);
     if (!fl)

@@ -215,4 +215,93 @@ int  hc_enc_submit(struct hc_enc *e, void *frame_opaque, uint64_t pts_ns, bool f
 int  hc_enc_receive(struct hc_enc *e, const uint8_t **data, int *size, bool *is_idr);
 void hc_enc_close(struct hc_enc *e);
 
+/* -------------------------------------------------------------------- mux */
+
+/*
+ * MPEG-TS over RTP, exactly as the Xiaomi sink accepted it. The layout is
+ * whatever we choose so long as it is self-consistent: AOSP's ATSParser reads
+ * the PMT PID from the PAT and the elementary PIDs from the PMT, hardcoding
+ * nothing but PID 0 (verified -- reference/aosp/ATSParser.cpp). We keep
+ * fluxcast's PIDs because that combination is field-proven against this sink.
+ */
+struct hc_mux;
+
+struct hc_mux_cfg {
+    const char *dst_ip;
+    int         dst_port;
+    int         src_port;        /* bind this locally; the sink checks it */
+    uint32_t    width, height, fps;
+    bool        with_audio;
+};
+
+struct hc_mux *hc_mux_open(const struct hc_mux_cfg *cfg,
+                           const uint8_t *extradata, int extradata_size);
+/* Feed one H.264 access unit. pts_ns is the capture clock. */
+int  hc_mux_video(struct hc_mux *m, const uint8_t *data, int size,
+                  uint64_t pts_ns, bool is_idr);
+/* Feed one encoded AAC frame from hc_audio_read(). */
+int  hc_mux_audio(struct hc_mux *m, const uint8_t *data, int size, uint64_t pts_ns);
+uint64_t hc_mux_bytes_sent(struct hc_mux *m);
+void hc_mux_close(struct hc_mux *m);
+
+/* ------------------------------------------------------------------ audio */
+
+/*
+ * PipeWire (via the pulse compat device) -> AAC-LC 48 kHz stereo, which is what
+ * the sink advertised as `AAC 00000007` and accepted as `AAC 00000001`.
+ * Runs on its own thread; hc_audio_read() pops from a bounded ring so a stalled
+ * muxer can never block capture.
+ */
+struct hc_audio;
+
+struct hc_audio_cfg {
+    const char *device;          /* pulse source name, e.g. "...monitor" */
+    uint32_t    bitrate_bps;     /* 128000 */
+};
+
+struct hc_audio *hc_audio_open(const struct hc_audio_cfg *cfg);
+/* 1 = frame returned, 0 = nothing pending, negative = error. */
+int  hc_audio_read(struct hc_audio *a, const uint8_t **data, int *size, uint64_t *pts_ns);
+/* 0.0 .. 1.0 applied to the captured PCM before encoding; live-tunable. */
+void hc_audio_set_volume(struct hc_audio *a, float gain);
+void hc_audio_set_muted(struct hc_audio *a, bool muted);
+void hc_audio_close(struct hc_audio *a);
+
+/* ---------------------------------------------------------------- control */
+
+/*
+ * Newline-delimited JSON over an inherited fd (3 by default). The Python
+ * control plane owns P2P and RTSP; this is how it drives the media leg.
+ *
+ *   -> {"cmd":"start","dst_ip":"192.168.168.42","dst_port":19900,
+ *       "src_port":19002,"width":1280,"height":720,"fps":60,
+ *       "bitrate":8000000,"gop":60,"output":"eDP-1","audio":"...monitor"}
+ *   -> {"cmd":"retune","fps":30}          fps/bitrate/qp, no restart
+ *   -> {"cmd":"idr"}                      honour the sink's IDR request
+ *   -> {"cmd":"volume","gain":0.5}        or {"muted":true}
+ *   -> {"cmd":"output","name":"HEADLESS-1"}   rebuild capture, keep the session
+ *   -> {"cmd":"stop"} / {"cmd":"quit"}
+ *
+ *   <- {"ev":"ready"}
+ *   <- {"ev":"stats","fps":58.2,"kbps":7502,"cpu":0.095,"drops":0,"idr":12}
+ *   <- {"ev":"error","msg":"..."}
+ */
+struct hc_ctl;
+
+struct hc_ctl_msg {
+    char     cmd[24];
+    char     s_dst_ip[64], s_output[64], s_audio[128];
+    int      dst_port, src_port;
+    uint32_t width, height, fps, bitrate, gop, qp;
+    float    gain;
+    bool     muted, has_muted;
+    bool     low_power, has_low_power;
+};
+
+struct hc_ctl *hc_ctl_open(int fd);
+/* 1 = message parsed, 0 = nothing pending, -1 = peer closed, -2 = error. */
+int  hc_ctl_poll(struct hc_ctl *c, struct hc_ctl_msg *out);
+int  hc_ctl_event(struct hc_ctl *c, const char *json);
+void hc_ctl_close(struct hc_ctl *c);
+
 #endif /* HC_H */

@@ -1,229 +1,200 @@
-# FluxCast
+# hyprcast
 
-<img src="https://fluxcast.secweb.cloud/flcast_logo_512x512.png" width="150" display="block">
+Stream this desktop to a Miracast TV over Wi-Fi Display, with the GPU doing the
+work and the CPU never touching a pixel.
 
-FluxCast streams a Linux desktop to a TV.
+**This is a private, single-purpose fork.** It targets exactly one machine and
+exactly one sink, it is not distributed, and it deliberately deletes every
+feature that machine does not use. If you want a general-purpose tool that
+supports many desktops, TVs and protocols, use
+[fluxcast](https://github.com/IlyaP358/fluxcast) upstream instead.
 
-[![Release](https://img.shields.io/github/v/release/IlyaP358/fluxcast?style=flat-square&color=green)](https://github.com/IlyaP358/fluxcast/releases)
-[![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey?style=flat-square&logo=linux)](https://www.linux.org/)
-[![Issues](https://img.shields.io/github/issues/IlyaP358/fluxcast?style=flat-square&color=red)](https://github.com/IlyaP358/fluxcast/issues)
-[![PRs](https://img.shields.io/github/issues-pr/IlyaP358/fluxcast?style=flat-square)](https://github.com/IlyaP358/fluxcast/pulls)
+---
 
-> 🌐 **Need a free subdomain for your project?** Check out [sub.fluxcast.dev](https://sub.fluxcast.dev) ([GitHub repo](https://github.com/IlyaP358/fluxcast-domains)) — a free GitOps subdomain registry for developers!
+## What it is
 
-## Demo
+fluxcast pushes frames through an `ffmpeg` subprocess and encodes H.264 in
+software with x264. On the target laptop that costs **197% of one core** and
+tops out at 84 fps for a 1080p job — which is why the picture stutters.
 
-https://github.com/user-attachments/assets/ce01804c-2f86-4a5d-8ecf-d6f2a72f55d1
+hyprcast replaces that path with a native C11 engine: Wayland
+`ext-image-copy-capture-v1` hands out a dmabuf, the buffer is imported straight
+into VA-API, colour-converted BGRX→NV12 by the GPU's VPP block, and encoded by
+`h264_vaapi`. No copies, no pixel ever crossing the CPU.
 
-## Project Status
+The Python layer that remains does Wi-Fi Direct group formation and the WFD
+RTSP/M1–M6 negotiation. Everything else is gone.
 
-Current validated scope:
+### Target
 
-- `wfd` is the primary path and the only mode tested as release-ready.
-- `dlna` works as fallback.
-- `cast` is experimental and currently not working in the tested Samsung setup.
+```
+i5-8350U (4c/8t, Kaby Lake-R) · Intel UHD 620 (Gen9.5) · /dev/dri/renderD128
+Hyprland 0.55.4 · eDP-1 1920x1080@60 · Intel 8265
+PipeWire 1.6.7 · ffmpeg n8.1.2 · iHD 26.1.5 · Python 3.14
+Sink: Xiaomi box running Google TV + its preinstalled Miracast app
+```
 
-The project currently focuses on **WFD/Miracast on Linux (Hyprland/wlroots class setups)**.  
-DLNA and Cast are available, but they are best treated as fallback or experimental paths.
+The sink negotiates **1280x720p60**, H.264 Constrained Baseline level 3.2, AAC
+48 kHz 2ch. Its maximum is 720p — 1080p is not on offer, so the engine captures
+1080p and scales to a 720p60 wire.
 
-Current limitation:
+---
 
-- KDE/GNOME Wayland desktop capture uses `xdg-desktop-portal` in WFD mode.
-- For portal mode, install Python dependency `dbus-next` and allow screen-share in the desktop picker dialog.
+## Measured numbers
 
-## Quick Start
+Reproduced on the machine above, not copied from a design document. Load is a
+realistic one (mpv playing a 1080p60 hardware-decoded clip); 1920x1080 capture →
+1280x720p60 wire.
 
-Default WFD run (interactive monitor/peer selection):
+| | capture p50 | vpp p50 | encode p50 | total p50 | fps | CPU |
+|---|---|---|---|---|---|---|
+| VBR / `EncSlice` | 8.85 ms | 0.32 ms | 7.51 ms | 16.69 ms | **58.2** | 9.5% |
+| CQP / `EncSliceLP` | 12.24 ms | 0.38 ms | **3.98 ms** | 16.79 ms | **57.8** | **6.6%** |
+
+Against fluxcast's x264 path at 197% of one core, that is roughly a **20–30x
+reduction in CPU**.
+
+Other measurements worth keeping:
+
+- `ext-image-copy-capture-v1` sustains 60.65 fps with 0 failures.
+- commit→ready latency is 2.8–3.6 ms.
+- VPP BGRX→NV12 costs 0.881 ms/frame, a 1135 fps ceiling.
+- The complete M1–M6 RTSP negotiation costs **333 ms**. The sink then sits for
+  **8.024 s** before it sends `PLAY` — that stall is entirely sink-side, so do
+  not add a timeout that fires inside it.
+
+Bitstream verified: Constrained Baseline, level 3.2, 1280x720, `has_b_frames=0`,
+bt709/tv, decodes with zero errors. Colour checked against a `grim` screenshot
+(mean RGB within 3/765), so the BGRX-vs-RGBX import is genuinely right rather
+than accidentally symmetric.
+
+Full detail, including the dmabuf modifier survey and the Wi-Fi regulatory
+constraints on this card, lives in [STATUS.md](STATUS.md).
+
+### Constraints that cost hours to rediscover
+
+- `Y_TILED_CCS` cannot be imported by iHD. The GBM modifier list is pinned to
+  `I915_FORMAT_MOD_Y_TILED` and `plane_count` is asserted `== 1`.
+- DRM `XR24` is byte-order BGRX. `VA_FOURCC_RGBX` silently swaps R and B.
+- VDEnc (`low_power=1`, `VAEntrypointEncSliceLP`) accepts **CQP only** on
+  Gen9.5. CBR and VBR both fail `avcodec_open2` with `EINVAL`.
+- The peer's IP and the `p2p-*` interface change between sessions. Resolve the
+  peer by ARP-scanning `p2p-*`; never assume a subnet.
+- Benchmark against a realistic load. `vkcube` saturates the same small GPU
+  being measured and produces fake numbers.
+
+---
+
+## Build
+
+The engine is C11, built with meson and ninja at `warning_level=3`, and compiles
+with zero warnings.
+
+```bash
+cd engine
+meson setup build
+ninja -C build
+```
+
+Everything needed is already installed on the target machine — no `pacman -S`
+required. Build dependencies are `wayland-client`, `gbm`, `libdrm`, `libva`,
+`libva-drm` and the ffmpeg libraries (`libavcodec`, `libavformat`, `libavutil`,
+`libavdevice`).
+
+This produces:
+
+| Binary | Purpose |
+|---|---|
+| `build/hyprcast-bench` | capture → import → VPP → encode, with per-stage histograms |
+| `build/capture-probe` | capture rate and latency (`MOD=Y_TILED`, `OUTPUT=`, `VERIFY=1`) |
+| `build/va-probe` | driver, dmabuf modifiers, encode entrypoints |
+| `build/vpp-probe` | RGB→NV12 timing |
+
+Capture is damage-driven, so the probes need something moving on screen to
+measure anything meaningful.
+
+## Run
+
+The Python side is **standard library only** — there is no `requirements.txt`
+and nothing to `pip install`.
 
 ```bash
 python3 src/main.py
 ```
 
-WFD with latency/session JSONL log:
+That scans for the sink, forms the Wi-Fi Direct group, negotiates the RTSP
+session and starts streaming at 60 fps. Useful flags:
 
 ```bash
-python3 src/main.py --wfd-latency-log
+python3 src/main.py --wfd-scan            # discovery only, then exit
+python3 src/main.py --fps 30 --bitrate 6M
+python3 src/main.py --monitor eDP-1       # skip the monitor picker
+python3 src/main.py --wfd-no-audio
+python3 src/main.py --wfd-latency-log     # JSONL latency/session log
 ```
 
-DLNA fallback:
+`python3 src/main.py --help` lists the rest.
+
+System binaries still required: `ffmpeg`, `iw`, `wpa_cli`, `nmcli`, `gdbus`, and
+`pactl` for audio monitor autodetection.
+
+## Test without the TV
+
+The loopback harness replays a byte-exact capture of a real session on
+`127.0.0.1`, so the whole RTSP and MPEG-TS layer can be developed with the TV
+switched off.
 
 ```bash
-python3 src/main.py --protocol dlna --transport hls
+python3 tools/rtsp-loopback-source.py   # the WFD RTSP source
+python3 tools/mock-sink.py              # replays the captured sink side
+python3 tools/assert-ts.py              # validates the resulting MPEG-TS
 ```
 
-Cast mode (optional, if your TV supports it):
+Verified: 9,301 datagrams, 65,107 TS packets, 0 lost / 0 reordered /
+0 duplicated / 0 malformed over 21.5 s at 4.6 Mbit/s, with all 12 `assert-ts`
+checks passing.
 
-```bash
-python3 src/main.py --protocol cast
+---
+
+## Layout
+
+```
+engine/            C11 native media path (meson + ninja)
+  protocol/        vendored wayland-protocols XML + wayland-scanner output
+  src/             hc.h is the contract; capture / dmabuf / vaapi / encode / hist / bench
+reference/
+  probes/          measured C probes — the numbers above came from these
+  hyprland/        Hyprland 0.55.4 screenshare implementation
+  aosp/            AOSP WFD source — the wire format is defined by these, not by specs
+  sink/            byte-exact capture of a confirmed-working 720p60 session
+  docs/            full design + fork analysis
+src/               Wi-Fi Direct + WFD RTSP negotiation (stdlib only)
+tools/             loopback harness: RTSP source, mock sink, MPEG-TS validator
 ```
 
-Force backend manually (if auto is not suitable on your session):
+## What was removed from fluxcast
 
-```bash
-python3 src/main.py --capture-backend wf-recorder
-python3 src/main.py --capture-backend x11grab
-python3 src/main.py --protocol wfd --wfd-capture-backend portal
-python3 src/main.py --protocol wfd --wfd-capture-backend wf-recorder
-python3 src/main.py --protocol wfd --wfd-capture-backend x11grab
-```
+DLNA (`upnpclient`), Chromecast (`pychromecast`), the HTTP/HLS bridge, the
+system tray (`pystray`, `Pillow`), `--doctor` diagnostics, the UIBC touch
+back-channel, the Microsoft-only LPCM muxer, the `xdg-desktop-portal` capture
+path, and the `wf-recorder`/`x11grab` capture backends — about 3,700 lines. With
+them went every third-party Python dependency.
 
-## What Works Best
+The LPCM/TS muxer is preserved verbatim at `reference/mpegts_muxer.py` as a
+dependency-free MPEG-TS reference.
 
-### WFD (Primary)
+---
 
-```text
-screen + audio capture -> H.264/AAC RTP -> Wi-Fi Direct + RTSP -> TV WFD receiver
-```
+## Credit and licence
 
-This is the lowest-latency and most predictable path in the current codebase.
+hyprcast is a fork of **[fluxcast](https://github.com/IlyaP358/fluxcast)**.
 
-### DLNA (Fallback)
+**Author: IlyaP358 | Code licensed under GPL-3.0**
 
-```text
-desktop capture -> HTTP stream -> DLNA/UPnP AVTransport -> native TV player
-```
+All of the Wi-Fi Direct group formation, the WFD RTSP state machine and the M1–M6
+negotiation in `src/` are IlyaP358's work, carried over from upstream. This fork
+adds the native capture and encode engine and removes what this one machine does
+not need.
 
-- Prefer `--transport hls` on Samsung TVs.
-- `progressive-ts` can freeze or stutter on some models.
-
-### Cast (Optional)
-
-- Requires a TV/device with real Google Cast support.
-- Requires `pychromecast`.
-- Not reliable on many Samsung TV models.
-
-
-## Installation
-
-### AppImage
-
-Download the latest `FluxCast-x86_64.AppImage` from the [Releases](https://github.com/IlyaP358/fluxcast/releases) page, then:
-
-```bash
-chmod +x FluxCast-x86_64.AppImage
-./FluxCast-x86_64.AppImage
-```
-
-On first launch FluxCast will ask for your password once to install a system file for Wi-Fi Direct.
-
-Depending on your desktop environment, you may need to install:
-- Hyprland / Sway: `wf-recorder`, `ffmpeg`
-- KDE / GNOME: `gst-plugins-ugly` (package name varies by distro)
-
-### PyPI
-
-```bash
-pip install fluxcast
-sudo fluxcast-install-system
-```
-
-`fluxcast-install-system` installs the D-Bus policy, desktop entry, and system packages (GStreamer, ffmpeg, NetworkManager, etc.). Run it once after the pip install.
-
-
-### Arch Linux - AUR
-
-```bash
-yay -S fluxcast-git
-# or
-paru -S fluxcast-git
-```
-
-### From source
-
-```bash
-git clone https://github.com/IlyaP358/fluxcast.git
-cd fluxcast
-pip install -r requirements.txt
-sudo meta/install.sh
-sudo systemctl reload dbus
-sudo gtk-update-icon-cache /usr/share/icons/hicolor
-```
-
-> [!WARNING]
-If `PIP` refuses to install the required libraries to your system, you will need to do that yourself using your distro's package manager.
-
-DLNA/Cast features require additional packages listed in `requirements.txt`.
-
-### System tools (just as important)
-
-WFD mode also depends on system binaries, not only Python packages:
-
-- `ffmpeg`
-- `wf-recorder` (Wayland/wlroots capture path)
-- `xdg-desktop-portal` (+ desktop backend: `xdg-desktop-portal-kde` / `xdg-desktop-portal-gnome` / `xdg-desktop-portal-wlr`)
-- `nmcli`, `gdbus`, `iw`, `wpa_cli` (Wi-Fi Direct and diagnostics)
-- `pactl` (audio monitor autodetect)
-
-Use:
-
-```bash
-python3 src/main.py --doctor
-```
-
-to check your machine before running WFD.
-
-Note: on KDE/GNOME Wayland, WFD auto backend now prefers `portal` first.
-
-Note: on **firewalld** systems, FluxCast opens the WFD RTSP port (`7236/tcp`) for the duration of a session and closes it on exit (no-op without firewalld; disable with `--wfd-no-firewall`). See [DOCUMENTATION.md](documentation/DOCUMENTATION.md) -> "WFD and firewalld".
-
-
-## Documentation
-
-Detailed flags, modes, and usage examples:  
-[documentation/DOCUMENTATION.md](documentation/DOCUMENTATION.md)
-
-## Tested Environment
-
-### Hardware:
-
-<details>
-<summary>ThinkBook 14 G4+ IAP</summary>
-
-- CPU: Intel i5-1240P (16 threads) up to 4.40 GHz
-- GPU: Intel Iris Xe Graphics
-- RAM: 16 GB
-
-</details>
-
-<details>
-<summary>Dell XPS 13 Plus</summary>
-
-- CPU: Intel i5-1260P (16 threads) up to 4.70 GHz
-- GPU: Intel Iris Xe Graphics
-- RAM: 16 GB LPDDR5
-
-</details>
-
-<details>
-<summary>ThinkPad T14 Gen 4</summary>
-
-- CPU: Intel i7-1355U (12 threads) up to 5.00 GHz
-- GPU: Intel Iris Xe Graphics
-- RAM: 32 GB
-
-</details>
-
-
-### Software:
-
-<details>
-<summary>Arch Linux</summary>
-
-- Kernels: 7.0.8-arch1-1, 6.12.91-1-lts612
-- WMs: Hyprland (0.55.2)
-- DEs (for testing): KDE Plasma (6.6.5) | GNOME (50.1)
-- Shell: zsh (5.9), fish (4.7.1)
-- Terminal: kitty (0.46.2, 0.47.1)
-
-</details>
-
-<details>
-<summary>CachyOS</summary>
-
-- Kernels: 7.0.3-1-cachyos
-- DEs (for testing): KDE Plasma (6.6.4)
-- Shell: bash (5.3.9)
-- Terminal: konsole (26.4.0)
-
-</details>
+Licensed under **GPL-3.0-or-later**, the same licence as upstream. See
+[LICENSE](LICENSE) for the full text.
