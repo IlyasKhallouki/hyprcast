@@ -124,6 +124,100 @@ So the `wfd.py:880-882` warning about PID layout does not bind for Android sinks
 
 ---
 
+## Milestone 2: end to end, verified against loopback
+
+`hyprcast` is a working command. Everything below was measured on this box after
+the milestone-2 integration, entirely through the loopback harness -- no TV.
+
+### Full stack: RTSP -> engine -> wire
+
+```
+tools/rtsp-loopback-source.py + tools/mock-sink.py + tools/assert-ts.py
+
+  15,915 datagrams   111,405 TS packets   26.7 s   6.33 Mbit/s
+  lost=0  reorder=0  dup=0  ts-regress=0  malformed=0
+  assert-ts.py: OVERALL PASS (12 of 12 checks)
+  IDR interval: min 1000.0  max 1000.0  mean 1000.0 ms  -- zero jitter
+```
+
+### The CFR pacer works
+
+The engine holds **60.0 fps on a completely idle desktop**, ~7-8 Mbit/s at
+5-11% of one core, 0 drops, 0 capture failures. Stats report 36-50 `repeats`
+per second: the pacer refilling grid slots that damage-driven capture left
+empty. `hyprcast-muxtest` (no pacer) fails PAT/PMT/PCR on an idle desktop with
+~160 ms gaps -- exactly the failure the pacer exists to prevent.
+
+### Runtime control, live, with zero drops
+
+```
+baseline               fps=60.0  kbps=7484  drops=0
+retune fps=30          fps=30.0  kbps=4474  drops=0
+retune bitrate=3M      fps=30.0  kbps=2944  drops=0
++ idr + volume + mute  fps=30.0  kbps=3064  drops=0
+```
+
+The stream still validates 12/12 **after** the mid-stream encoder rebuild, so
+SPS/PPS are being spliced ahead of the next IDR correctly.
+
+### Audio opens the monitor, not the microphone
+
+`alsa_output.pci-0000_00_1f.3.analog-stereo.monitor`. fluxcast's fallback to
+Pulse device `"default"` opened the mic -- a silent privacy failure. Fixed.
+
+---
+
+## We crashed Hyprland once. Read this before touching outputs.
+
+2026-08-02 16:09:30, Hyprland 0.55.4 aborted with SIGABRT (14.6 MB coredump),
+taking awww-daemon, hyprsunset and xdg-desktop-portal-hyprland with it.
+
+```
+#5  Screenshare::CScreenshareFrame::transform() const
+#6  CImageCopyCaptureFrame::CImageCopyCaptureFrame(...)
+#12 libwayland-server   <- dispatching our create_frame
+```
+
+`CScreenshareFrame::transform()` returns `m_session->monitor()->m_transform`
+with no null check (`reference/hyprland/hypr_ScreenshareFrame.cpp:487-494`),
+reached from the frame constructor via `nextFrame()`
+(`hypr_ImageCopyCapture.cpp:355`). Once the captured output is gone,
+`monitor()` is null and `create_frame` aborts the entire compositor.
+
+Trigger: headless outputs were being created and destroyed on the live session
+while capture sessions were bound to them.
+
+Guarded in `capture.c` (`hc_capture_submit` refuses once `output_gone` latches).
+**Never test output create/remove against the live compositor** -- use a nested
+Hyprland instance.
+
+This is also a real Hyprland bug: any unprivileged client can abort the
+compositor. Worth reporting upstream, hand-written -- hyprwm bans AI-authored
+issues.
+
+---
+
+## Using it
+
+```bash
+ln -sf ~/projects/hyprcast/packaging/hyprcast ~/.local/bin/hyprcast
+
+hyprcast doctor                      # checks only what blocks a cast
+hyprcast cast                        # discover the sink and start
+hyprcast cast --fps 60 --bitrate 6M
+hyprcast ctl fps 30
+hyprcast ctl bitrate 6M
+hyprcast ctl volume 50
+hyprcast ctl mute
+hyprcast status
+hyprcast waybar                      # see packaging/waybar-module.jsonc
+```
+
+Sink ceiling is 1280x720p60 -- 1080p is not available (level 4.1 and
+max_hres/max_vres both forbid it).
+
+---
+
 ## ✅ Project-kill gate — PASSED
 
 Confirmed on 2026-08-02 with a real session that rendered on screen. The concern
