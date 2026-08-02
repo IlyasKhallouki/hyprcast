@@ -596,7 +596,36 @@ def _selected_video_format(
         f"{vesa_mask:08x} 00000000 00 0000 0000 00 none none"
     )
 
-def _safe_source_port(requested: int, sink_port: int, sink_rtcp_port: int = 0) -> int:
+def _udp_pair_free(port: int, local_ip: str = "") -> bool:
+    """True if we can bind both `port` (RTP) and `port + 1` (RTCP) right now."""
+    socks = []
+    try:
+        for candidate in (port, port + 1):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Deliberately NOT SO_REUSEADDR: we want to know whether ffmpeg's
+            # avio will be able to take the port for real, and it does not set
+            # it either. A permissive probe here would pass and then fail later,
+            # after the port is already promised to the sink in SETUP.
+            sock.bind((local_ip or "", candidate))
+            socks.append(sock)
+        return True
+    except OSError:
+        return False
+    finally:
+        for sock in socks:
+            sock.close()
+
+
+def _safe_source_port(requested: int, sink_port: int, sink_rtcp_port: int = 0,
+                      local_ip: str = "") -> int:
+    """Pick an RTP/RTCP source port pair that is free *and* not the sink's.
+
+    This must settle before SETUP, because the source port goes out on the wire
+    and the sink checks it -- the port cannot be moved afterwards. Previously
+    this only avoided the sink's own ports, so a stale listener on 19002 was
+    not noticed until hc_mux_open, by which point the engine had to fail, the
+    session tore down, and the TV dropped the connection.
+    """
     blocked = {sink_port}
     if sink_rtcp_port:
         blocked.add(sink_rtcp_port)
@@ -606,9 +635,19 @@ def _safe_source_port(requested: int, sink_port: int, sink_rtcp_port: int = 0) -
     port = requested
     if port % 2:
         port += 1
-    while port in blocked or port + 1 in blocked:
+
+    first = port
+    while port < 65000:
+        if port not in blocked and port + 1 not in blocked and _udp_pair_free(port, local_ip):
+            if port != first:
+                print(f"[hyprcast WFD] Source RTP port {first} unavailable; using {port}.")
+            return port
         port += 2
-    return port
+
+    raise WFDNotReady(
+        f"No free UDP port pair for RTP from {first} upwards. Something is "
+        f"holding the range -- check with: ss -ulpn | grep 19[0-9][0-9][0-9]"
+    )
 
 
 def _interface_for_ip(local_ip: str) -> Optional[str]:
@@ -1195,6 +1234,7 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
                 self.media_config.source_port,
                 self.sink_rtp_port,
                 self.sink_rtcp_port,
+                self.local_ip,
             )
             self.sink_video_format = _parse_sink_video_format(
                 params.get("wfd_video_formats", "")
@@ -1913,20 +1953,9 @@ def _nm_stop_find(path: str) -> None:
         pass
 
 
-def _nm_scan(interface: Optional[str], timeout: int) -> list[WFDPeer]:
-    path = _nm_p2p_device_path(interface)
-    if not path:
-        raise WFDNotReady("NetworkManager did not expose a Wi-Fi P2P device.")
-
-    iface = _nm_get_string(path, "org.freedesktop.NetworkManager.Device", "Interface") or path
-    print(f"[hyprcast WFD] Starting NetworkManager Wi-Fi Direct scan on {iface} for {timeout}s...")
-    _nm_start_find(path, timeout)
-    try:
-        time.sleep(max(1, timeout))
-        peers_raw = _nm_get_property(path, "org.freedesktop.NetworkManager.Device.WifiP2P", "Peers")
-    finally:
-        _nm_stop_find(path)
-
+def _nm_collect_peers(path: str) -> list[WFDPeer]:
+    """Snapshot NetworkManager's current P2P peer list."""
+    peers_raw = _nm_get_property(path, "org.freedesktop.NetworkManager.Device.WifiP2P", "Peers")
     peers = []
     for peer_path in _object_paths(peers_raw):
         name = _nm_get_string(peer_path, "org.freedesktop.NetworkManager.WifiP2PPeer", "Name")
@@ -1957,6 +1986,48 @@ def _nm_scan(interface: Optional[str], timeout: int) -> list[WFDPeer]:
             source="NetworkManager",
             rtsp_port=sink_rtsp_port,
         ))
+    return peers
+
+
+def _has_wfd_sink(peers: list[WFDPeer]) -> bool:
+    """True once a peer is advertising Wi-Fi Display capability."""
+    return any("wfd_ies=" in (p.details or "") or p.rtsp_port for p in peers)
+
+
+def _nm_scan(interface: Optional[str], timeout: int) -> list[WFDPeer]:
+    path = _nm_p2p_device_path(interface)
+    if not path:
+        raise WFDNotReady("NetworkManager did not expose a Wi-Fi P2P device.")
+
+    iface = _nm_get_string(path, "org.freedesktop.NetworkManager.Device", "Interface") or path
+    print(f"[hyprcast WFD] Scanning for Wi-Fi Display sinks on {iface} "
+          f"(up to {timeout}s, stops as soon as one answers)...", flush=True)
+    _nm_start_find(path, timeout)
+
+    # Poll rather than sleeping the whole timeout. Discovery hops the social
+    # channels 1/6/11, so a sink usually appears within a few seconds; sitting
+    # mute for the full 60 looks exactly like a hang, which is what it was
+    # mistaken for.
+    peers: list[WFDPeer] = []
+    deadline = time.monotonic() + max(1, timeout)
+    last_note = 0.0
+    try:
+        while True:
+            peers = _nm_collect_peers(path)
+            if _has_wfd_sink(peers):
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            if now - last_note >= 5.0:
+                last_note = now
+                left = int(deadline - now)
+                seen = f", {len(peers)} non-WFD peer(s) so far" if peers else ""
+                print(f"[hyprcast WFD]   ...still looking, {left}s left{seen}", flush=True)
+            time.sleep(1.0)
+    finally:
+        _nm_stop_find(path)
+
     return peers
 
 

@@ -226,6 +226,27 @@ def _split_peer(value: str | None) -> tuple[str, int]:
     return value, 0
 
 
+
+# ------------------------------------------------------------------- scan
+def cmd_scan(args) -> int:
+    """Look for Wi-Fi Display sinks without starting a session.
+
+    The single most useful diagnostic: it separates "the TV stopped
+    advertising" from "hyprcast is broken". Android Miracast apps leave
+    discovery mode after a short window, so a scan that finds nothing usually
+    just means the app needs re-arming.
+    """
+    from . import wfd
+    peers = wfd.active_scan(interface=args.interface, timeout=args.timeout)
+    wfd.print_scan(peers)
+    if not peers:
+        print(f"\n{PROG}: no sink is advertising. On the TV, re-open the "
+              f"Miracast / Screen Share app so it starts advertising again, "
+              f"then run `{PROG} cast`.", file=sys.stderr)
+        return 1
+    return 0
+
+
 # -------------------------------------------------------------------- ctl
 _CTL_VALUE_CMDS = {"fps", "bitrate", "volume", "monitor", "mode"}
 _CTL_NOARG_CMDS = {"status", "start", "stop", "list-outputs", "list-sinks", "quit"}
@@ -503,6 +524,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     wb = sub.add_parser("waybar", help="stream waybar JSON on stdout")
     wb.set_defaults(func=cmd_waybar)
+
+    scan = sub.add_parser("scan", help="look for sinks without casting")
+    scan.add_argument("--interface", default="p2p-dev-wlan0")
+    scan.add_argument("--timeout", type=int, default=15)
+    scan.set_defaults(func=cmd_scan)
 
     doc = sub.add_parser("doctor", help="check only what actually blocks a cast")
     doc.add_argument("--json", action="store_true")
