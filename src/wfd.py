@@ -1745,6 +1745,27 @@ class WFDMediaPipeline:
         self.processes = [proc]
 
 
+def _wire_dump(direction: str, text: str) -> None:
+    """
+    Append a verbatim copy of one RTSP message to $HYPRCAST_RTSP_DUMP.
+
+    The sink's M3 GET_PARAMETER response body is the authoritative definition of
+    every format table in this fork -- AOSP defaults are not a substitute. Capture
+    it byte-exactly once, then develop against tools/mock-sink.py instead of the TV.
+    """
+    path = os.environ.get("HYPRCAST_RTSP_DUMP")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"===== {direction} {time.time():.6f} =====\n")
+            fh.write(text)
+            if not text.endswith("\n"):
+                fh.write("\n")
+    except OSError:
+        pass
+
+
 def _read_rtsp_message(rfile) -> Optional[RTSPMessage]:
     lines = []
     while True:
@@ -1857,6 +1878,10 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
                 if msg is None:
                     print(f"[FluxCast WFD RTSP] TV disconnected from {peer}")
                     return
+                _wire_dump(
+                    "RX",
+                    "\r\n".join([msg.start, *msg.raw_headers, "", msg.body]),
+                )
                 self._log_message(msg)
                 if msg.is_response:
                     self._handle_response(msg)
@@ -1899,6 +1924,7 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
 
     def _send_bytes(self, text: str) -> None:
         with self._write_lock:
+            _wire_dump("TX", text)
             self.wfile.write(text.encode("utf-8"))
             self.wfile.flush()
 
@@ -3323,6 +3349,7 @@ def _active_rtsp_probe(
         if body:
             lines += ["Content-Type: text/parameters", f"Content-Length: {len(body.encode())}"]
         lines += ["", body]
+        _wire_dump("TX", "\r\n".join(lines))
         wfile.write("\r\n".join(lines).encode())
         wfile.flush()
         print(f"[FluxCast WFD RTSP] Active probe -> {name}")
@@ -3332,6 +3359,7 @@ def _active_rtsp_probe(
         for k, v in (extra or {}).items():
             lines.append(f"{k}: {v}")
         lines += [f"Content-Length: {len(body.encode())}", "", body]
+        _wire_dump("TX", "\r\n".join(lines))
         wfile.write("\r\n".join(lines).encode())
         wfile.flush()
 
@@ -3344,6 +3372,7 @@ def _active_rtsp_probe(
                 if msg is None:
                     print("[FluxCast WFD RTSP] Active probe: TV closed connection.")
                     break
+                _wire_dump("RX", "\r\n".join([msg.start, *msg.raw_headers, "", msg.body]))
 
                 if msg.is_response:
                     name = st["pending"].pop(msg.cseq, "UNKNOWN")
