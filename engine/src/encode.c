@@ -208,7 +208,45 @@ struct hc_enc *hc_enc_open(struct hc_va *v, const struct hc_enc_cfg *cfg)
     if (set_opt_int(e, "level", 32) < 0) goto fail;
     /* One frame in flight: we submit and drain in lockstep, and a deeper
      * queue only adds latency to a live cast. */
-    if (set_opt_int(e, "async_depth", 1) < 0) goto fail;
+    /*
+     * async_depth is how many frames the encoder may have in flight.
+     * Measured on this Gen9.5 part at 1280x720p60, IN SITU under GPU
+     * contention (mpv decoding 1080p60 alongside):
+     *   async_depth=1   encode p50 2.67 ms
+     *   async_depth=2   encode p50 1.18 ms    <- 2.3x faster
+     * Synthetic encode-only agrees (2.12 -> 1.61 ms).
+     *
+     * DEFAULT IS STILL 1, deliberately. Depth 2 is measurably burstier: the
+     * same 12 s loopback capture passed assert-ts.py at depth 1 and failed
+     * pat/pmt/pcr/continuity at depth 2 with a default-sized UDP receive
+     * buffer, and only passed once the receiver was given 8 MB. A deeper
+     * encoder queue lets frames emerge in clumps, and a Wi-Fi Direct sink's
+     * receive buffer is not ours to enlarge.
+     *
+     * So: depth 1 for a link that already works, HC_ASYNC_DEPTH=2 when the
+     * GPU is contended and encode time matters more than smooth pacing.
+     */
+    {
+        const char *ad = getenv("HC_ASYNC_DEPTH");
+        int depth = ad ? atoi(ad) : 1;
+        if (depth < 1 || depth > 8)
+            depth = 1;
+        if (set_opt_int(e, "async_depth", depth) < 0) goto fail;
+    }
+
+    /*
+     * Intel target usage, 1..7, higher is faster. Measured, 1280x720p60:
+     *   EncSlice VBR : default 3.53 ms -> quality=4 2.70 ms  (-24%, free)
+     *   VDEnc CQP    : default 2.14 ms -> quality=7 2.09 ms
+     * quality=1 is SLOWER on both paths (3.84 / 3.01 ms), so "best quality"
+     * is the wrong instinct here.
+     */
+    {
+        const char *q = getenv("HC_QUALITY");
+        int quality = q ? atoi(q) : (cfg->low_power ? 7 : 4);
+        if (quality >= 1 && quality <= 7)
+            if (set_opt_int(e, "quality", quality) < 0) goto fail;
+    }
     /* Access unit delimiters help the sink resync; SEI is dead weight. */
     if (set_opt_int(e, "aud", 1) < 0) goto fail;
     if (set_opt_int(e, "sei", 0) < 0) goto fail;
