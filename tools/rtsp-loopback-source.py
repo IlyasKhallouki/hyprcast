@@ -31,11 +31,11 @@ import time
 sys.path.insert(
     0,
     os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"
     ),
 )
 
-from wfd import WFDMediaConfig, WFDRTSPServer, select_monitor  # noqa: E402
+from hyprcast.wfd import WFDMediaConfig, WFDRTSPServer, select_monitor  # noqa: E402
 
 
 def main() -> int:

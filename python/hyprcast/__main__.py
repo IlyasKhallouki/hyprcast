@@ -30,6 +30,119 @@ PROG = "hyprcast"
 
 # ------------------------------------------------------------------- cast
 def cmd_cast(args) -> int:
+    """
+    Two routes to a session:
+
+      no --peer  -> the real Wi-Fi Display flow. P2P discovery, group
+                    formation, the M1-M7 RTSP handshake, and only then the
+                    engine, started with whatever the sink actually agreed to.
+                    This is what you want.
+
+      --peer     -> skip P2P and RTSP and stream straight at an address. Only
+                    useful against tools/mock-sink.py, because a real sink will
+                    not render anything it did not negotiate.
+    """
+    if not args.peer:
+        return _cast_wfd(args)
+    return _cast_direct(args)
+
+
+def _cast_wfd(args) -> int:
+    """Discover the sink over Wi-Fi Direct, negotiate, and cast to it."""
+    from . import wfd
+
+    ns = argparse.Namespace(
+        fps=args.fps,
+        bitrate=args.bitrate,
+        output_res=(f"{args.width}x{args.height}" if args.width and args.height else None),
+        monitor_name=args.monitor or None,
+        wfd_interface=args.interface,
+        wfd_timeout=args.timeout,
+        wfd_peer=args.sink,
+        wfd_rtsp_port=args.rtsp_port,
+        wfd_rtp_source_port=args.src_port,
+        wfd_no_audio=(args.audio == "none"),
+        wfd_audio_device=None,
+        wfd_low_power=args.low_power,
+        wfd_qp=args.qp,
+        wfd_no_firewall=args.no_firewall,
+        wfd_go_intent=args.go_intent,
+        wfd_latency_log=args.latency_log,
+        wfd_dry_run=False,
+        engine=None,
+    )
+
+    # Serve the ctl socket alongside, bridged to whichever pipeline is live, so
+    # `hyprcast ctl fps 30` works while the WFD flow owns the main thread.
+    server = None
+    try:
+        server = ctlmod.Server(
+            lambda cmd, params: _ctl_bridge(wfd, cmd, params),
+            lambda: _wfd_snapshot(wfd, ns),
+        )
+        server.serve_in_background()
+        print(f"{PROG}: control socket {server.path}")
+    except ctlmod.CtlError as exc:
+        print(f"{PROG}: control socket unavailable ({exc}); "
+              f"casting anyway without runtime control", file=sys.stderr)
+
+    try:
+        wfd.start_experimental_backend(ns)
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    except wfd.WFDNotReady as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        if server is not None:
+            server.server_close()
+
+
+def _ctl_bridge(wfd, cmd: str, params: dict):
+    """Route a ctl command at the live WFD pipeline."""
+    p = wfd.current_pipeline()
+    if p is None:
+        raise ctlmod.CtlError("no session is running")
+    if cmd == "fps":
+        p.retune(fps=int(params["value"]))
+    elif cmd == "bitrate":
+        p.retune(bitrate=int(params["value"]))
+    elif cmd == "qp":
+        p.retune(qp=int(params["value"]))
+    elif cmd == "volume":
+        p.volume(gain=float(params["value"]) / 100.0)
+    elif cmd == "mute":
+        p.volume(muted=bool(params.get("value", True)))
+    elif cmd == "idr":
+        p.request_idr()
+    elif cmd == "monitor":
+        p.set_output(str(params["value"]))
+    elif cmd == "stop":
+        p.stop()
+    else:
+        raise ctlmod.CtlError(f"unsupported while casting over WFD: {cmd}")
+    return {"ok": True}
+
+
+def _wfd_snapshot(wfd, ns) -> dict:
+    p = wfd.current_pipeline()
+    if p is None:
+        return {"state": "discovering", "peer": ns.wfd_peer or "", "fps": ns.fps}
+    return {
+        "state": "casting" if p.is_alive() else "error",
+        "peer": p.tv_ip,
+        "width": p.width,
+        "height": p.height,
+        "fps": p.config.fps,
+        "bitrate_kbits": p.bitrate_kbits,
+        "mode": "mirror",
+        "capture_output": (p.config.monitor.name if p.config.monitor else ""),
+        "health": p.health_summary(),
+    }
+
+
+def _cast_direct(args) -> int:
     stop = threading.Event()
 
     def _quit(signum, frame):
@@ -355,10 +468,25 @@ def build_parser() -> argparse.ArgumentParser:
                       help="tv-only routes playback through a null sink so the "
                            "laptop speakers stay silent")
     cast.add_argument("--peer", metavar="IP[:PORT]",
-                      help="sink RTP address (WFD discovery lands with the RTSP milestone)")
+                      help="stream straight at this address, skipping P2P+RTSP (mock-sink only)")
     cast.add_argument("--src-port", type=int, default=19002)
     cast.add_argument("--low-power", action="store_true",
                       help="VDEnc/EncSliceLP -- CQP only on Gen9.5, ignores --bitrate")
+    cast.add_argument("--sink", metavar="MAC",
+                      help="skip discovery and connect to this P2P peer MAC")
+    cast.add_argument("--interface", default="p2p-dev-wlan0",
+                      help="wpa_supplicant P2P control interface")
+    cast.add_argument("--timeout", type=int, default=60,
+                      help="seconds to wait for the sink to appear")
+    cast.add_argument("--rtsp-port", type=int, default=7236)
+    cast.add_argument("--go-intent", type=int, default=None, metavar="0-15",
+                      help="P2P group-owner intent; 15 makes us the GO")
+    cast.add_argument("--qp", type=int, default=None,
+                      help="CQP quantiser, only with --low-power")
+    cast.add_argument("--no-firewall", action="store_true",
+                      help="do not touch firewalld (it can time out on this box)")
+    cast.add_argument("--latency-log", nargs="?", const=True, default=None,
+                      metavar="PATH", help="write a session JSONL")
     cast.add_argument("--idle", action="store_true",
                       help="serve the control socket without starting the media path")
     cast.set_defaults(func=cmd_cast)

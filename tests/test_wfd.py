@@ -7,9 +7,9 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
-import wfd  # noqa: E402
+from hyprcast import wfd  # noqa: E402
 
 
 def _completed(stdout="", returncode=0, stderr=""):

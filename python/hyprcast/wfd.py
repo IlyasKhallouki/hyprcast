@@ -15,17 +15,28 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from typing import NamedTuple, Optional
 
-# The media leg is hyprcast-engine, driven over a socketpair by
-# python/hyprcast/engine.py. src/ is what ends up on sys.path (main.py lives
-# here), so put the package root there too rather than depending on an install.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_PY_ROOT = os.path.join(_REPO_ROOT, "python")
-if os.path.isdir(_PY_ROOT) and _PY_ROOT not in sys.path:
-    sys.path.insert(0, _PY_ROOT)
-
-from hyprcast.engine import Engine, EngineError  # noqa: E402
+# The media leg is hyprcast-engine, driven over a socketpair by engine.py.
+from .engine import Engine, EngineError
 
 WFD_RTSP_PORT = 7236
+
+# The live WFDMediaPipeline, published so the ctl socket can drive it while the
+# WFD flow owns the main thread. Set on engine start, cleared on stop.
+_ACTIVE: "Optional[WFDMediaPipeline]" = None
+_ACTIVE_LOCK = threading.Lock()
+
+
+def current_pipeline():
+    """The pipeline of the running session, or None."""
+    with _ACTIVE_LOCK:
+        return _ACTIVE
+
+
+def _publish(pipeline) -> None:
+    global _ACTIVE
+    with _ACTIVE_LOCK:
+        _ACTIVE = pipeline
+
 try:
     _DEVICE_NAME: str = re.sub(r"[^a-zA-Z0-9\-]", "", socket.gethostname().split(".")[0])[:32] or "FluxCast"
 except OSError:
@@ -759,6 +770,7 @@ class NativeSender:
             engine.quit()
             raise WFDNotReady(f"hyprcast-engine failed to start: {exc}") from exc
         self.engine = engine
+        _publish(self)
         _append_latency_log(
             self.config.latency_log_path,
             "engine_ready",
@@ -776,6 +788,7 @@ class NativeSender:
         return engine is not None and engine.is_alive()
 
     def stop(self) -> None:
+        _publish(None)
         with self._lock:
             engine, self.engine = self.engine, None
         if engine is None:
@@ -2189,6 +2202,13 @@ def _cleanup_step(label: str, action) -> None:
 def _select_peer(peers: list[WFDPeer], selector: Optional[str]) -> WFDPeer:
     if not peers:
         raise WFDNotReady("No Wi-Fi Direct peers found. Put the TV into Screen Share/Wireless Display mode.")
+    if selector is None and len(peers) == 1:
+        # One sink is the normal case on a personal machine. Prompting for it
+        # makes `hyprcast cast` un-scriptable and hangs when stdin is not a tty.
+        only = peers[0]
+        print(f"[hyprcast WFD] Using the only peer: {only.address}"
+              f"{'  ' + only.name if only.name else ''}")
+        return only
     if selector is None:
         print_scan(peers)
         try:
