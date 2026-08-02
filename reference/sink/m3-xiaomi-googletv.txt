@@ -1,0 +1,8 @@
+# Xiaomi box / Google TV Miracast app -- M3 GET_PARAMETER response body
+# Captured 2026-08-02. Peer 'TV', P2P dev addr 72:c9:12:c3:11:8a (randomized).
+# wfd_dev_info=0x00111c440032 -> WFD Primary Sink, available, P2P, RTSP port 7236, 50 Mbps
+# This is the authoritative wire spec for hyprcast. Do not substitute AOSP defaults.
+wfd_audio_codecs: LPCM 00000003 00, AAC 00000007 00
+wfd_video_formats: 00 01 01 08 0001ffff 0f3fffff 00000fff 00 0000 0000 13 0500 02D0
+wfd_content_protection: HDCP2.1 port=4990
+wfd_client_rtp_ports: RTP/AVP/UDP;unicast 19900 0 mode=play

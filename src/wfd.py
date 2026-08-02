@@ -1745,6 +1745,9 @@ class WFDMediaPipeline:
         self.processes = [proc]
 
 
+_WIRE_DUMP_BROKEN = False
+
+
 def _wire_dump(direction: str, text: str) -> None:
     """
     Append a verbatim copy of one RTSP message to $HYPRCAST_RTSP_DUMP.
@@ -1753,17 +1756,26 @@ def _wire_dump(direction: str, text: str) -> None:
     every format table in this fork -- AOSP defaults are not a substitute. Capture
     it byte-exactly once, then develop against tools/mock-sink.py instead of the TV.
     """
-    path = os.environ.get("HYPRCAST_RTSP_DUMP")
-    if not path:
+    raw = os.environ.get("HYPRCAST_RTSP_DUMP")
+    if not raw:
         return
+    # fish's `export VAR=~/x` does not expand the tilde; expand it ourselves
+    # rather than silently failing to write the one artifact this exists for.
+    path = os.path.expanduser(os.path.expandvars(raw))
     try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(f"===== {direction} {time.time():.6f} =====\n")
             fh.write(text)
             if not text.endswith("\n"):
                 fh.write("\n")
-    except OSError:
-        pass
+    except OSError as exc:
+        global _WIRE_DUMP_BROKEN
+        if not _WIRE_DUMP_BROKEN:
+            _WIRE_DUMP_BROKEN = True
+            print(f"[hyprcast] RTSP wire dump DISABLED: cannot write {path!r}: {exc}")
 
 
 def _read_rtsp_message(rfile) -> Optional[RTSPMessage]:
