@@ -198,6 +198,39 @@ issues.
 ---
 
 
+## The TV's Fluency/Definition setting decides what you can have
+
+Measured with `hyprcast probe`, same TV, one setting changed between runs:
+
+| TV setting | CEA mask | level | audio | best mode |
+|---|---|---|---|---|
+| Fluency | `0x00000020` | 3.1 | `AAC 00000001` | 1280x720p30 |
+| **Definition** | `0x0001ffff` | 4.1 | `LPCM 3` + `AAC 7` | **1280x720p60** |
+
+Counter-intuitive naming: **Definition** is the one that unlocks 60 fps.
+Set it there and `hyprcast cast` negotiates 720p60 with no flags.
+
+### max_hres/max_vres are binding, and fluxcast never parsed them
+
+In Definition mode the sink advertises `CEA 0x0001ffff`, which *includes*
+1080p30 and 1080p60 -- and then caps itself with `max_hres 0x0500 = 1280`,
+`max_vres 0x02D0 = 720` in the same string.
+
+hyprcast originally picked **1920x1080p30**: inside the CEA mask, inside
+level 4.1 at 244800 of 245760 MB/s, and in violation of the sink's own stated
+maximum. `grep max_hres` over the inherited fluxcast tree returned nothing --
+the fields were never parsed. Now they are, and they filter mode selection:
+
+```
+definition + --fps 60 -> 1280x720p60   (was 1920x1080p30)
+definition + --fps 30 -> 1280x720p30
+fluency    + any fps  -> 1280x720p30   (only mode offered)
+```
+
+1080p60 is impossible regardless: 489600 MB/s against level 4.1's 245760.
+
+---
+
 ## The sink's advertised capability VARIES between sessions
 
 Two M3 responses from the same Xiaomi box, hours apart:

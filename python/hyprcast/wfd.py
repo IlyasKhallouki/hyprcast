@@ -200,6 +200,12 @@ class WFDVideoFormat:
     cea_mask: int
     vesa_mask: int
     hh_mask: int
+    # Optional trailing fields. A sink may advertise modes in the CEA mask that
+    # exceed its own stated maximum -- this Xiaomi offers 1080p60 in
+    # 0x0001ffff while capping itself at 1280x720 -- so these are a hard filter,
+    # not a hint. 0 means "not advertised", i.e. no dimension limit.
+    max_hres: int = 0
+    max_vres: int = 0
 
 
 @dataclass(frozen=True)
@@ -412,6 +418,16 @@ def _append_latency_log(path: Optional[str], event: str, **fields: object) -> No
         pass
 
 
+def _opt_hex(tokens: list[str], index: int) -> int:
+    """Optional trailing hex field; 0 when absent or unparseable."""
+    if index >= len(tokens):
+        return 0
+    try:
+        return int(tokens[index], 16)
+    except ValueError:
+        return 0
+
+
 def _parse_sink_video_format(value: str) -> Optional[WFDVideoFormat]:
     first_codec = value.split(",", 1)[0]
     tokens = first_codec.split()
@@ -426,6 +442,8 @@ def _parse_sink_video_format(value: str) -> Optional[WFDVideoFormat]:
             cea_mask=int(tokens[4], 16),
             vesa_mask=int(tokens[5], 16),
             hh_mask=int(tokens[6], 16),
+            max_hres=_opt_hex(tokens, 11),
+            max_vres=_opt_hex(tokens, 12),
         )
     except ValueError:
         return None
@@ -491,6 +509,9 @@ def _choose_cea_mode(
 
     all_modes = {**WFD_CEA_MODES, **WFD_VESA_MODES}
 
+    max_hres = sink_format.max_hres if sink_format else 0
+    max_vres = sink_format.max_vres if sink_format else 0
+
     def supports(bit: int) -> bool:
         mode = all_modes[bit]
         if mode.table == "vesa":
@@ -499,6 +520,15 @@ def _choose_cea_mode(
         else:
             if not (cea_supported & bit):
                 return False
+        # A sink can advertise modes in its mask that exceed its own stated
+        # maximum. This Xiaomi offers 1080p60 inside CEA 0x0001ffff while
+        # capping itself at max_hres/max_vres = 1280x720; sending 1080p30 to it
+        # satisfies the mask and the level and still violates what it asked
+        # for. Treat the stated maximum as binding.
+        if max_hres and mode.width > max_hres:
+            return False
+        if max_vres and mode.height > max_vres:
+            return False
         return max_level is None or _wfd_level_for_mode(mode) <= max_level
 
     # Build preference order: if monitor is 1200p, prefer VESA 1200p modes first
