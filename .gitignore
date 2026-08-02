@@ -13,3 +13,8 @@ build/
 *.egg-info/
 dist/
 fluxcast_domains
+
+# hyprcast
+engine/build/
+*.h264
+*.log
