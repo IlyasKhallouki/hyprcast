@@ -197,6 +197,38 @@ issues.
 
 ---
 
+
+## The sink's advertised capability VARIES between sessions
+
+Two M3 responses from the same Xiaomi box, hours apart:
+
+```
+full:     00 01 01 08 0001ffff 0f3fffff 00000fff 00 0000 0000 13 0500 02D0
+degraded: 00 00 01 01 00000020 00000000 00000000 00 0000 0000 00 none none
+```
+
+The degraded one offers **CEA mask 0x00000020 -- bit 5 only, 1280x720p30 and
+nothing else**, level 3.1 instead of 4.1, VESA and HH tables empty, and no
+max_hres/max_vres at all. hyprcast correctly negotiates 720p30 against it,
+because that is the only mode on the table.
+
+If you get 30 fps when you wanted 60, it is the TV, not hyprcast. Fully quit
+and re-open the Miracast app on the TV -- a session that ended badly leaves it
+advertising a reduced set. Check what you are being offered without starting a
+session:
+
+```bash
+hyprcast scan
+```
+
+and read the negotiated mode in the cast log:
+
+```
+[hyprcast WFD RTSP] Negotiated media mode: 1280x720p60
+```
+
+---
+
 ## Using it
 
 ```bash
