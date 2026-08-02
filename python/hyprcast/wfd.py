@@ -165,12 +165,17 @@ class RTSPMessage:
         return " ".join(parts[1:]) if len(parts) >= 2 else ""
 
 
+class WFDProbeDone(Exception):
+    """Raised to unwind a probe session cleanly once M3 has been read."""
+
+
 @dataclass
 class WFDMediaConfig:
     """Everything the media leg needs. Nine of these cross the fd-3 seam."""
 
     monitor: Optional["Monitor"]
     fps: int = 60
+    probe_only: bool = False
     bitrate: str = "4M"
     output_resolution: Optional[str] = None
     audio_device: Optional[str] = None
@@ -1051,6 +1056,9 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
                     self._handle_response(msg)
                 else:
                     self._handle_request(msg)
+        except WFDProbeDone:
+            target = getattr(self.server, "parent_server", self.server)
+            target.probe_done = True
         except WFDNotReady as exc:
             print(f"[hyprcast WFD RTSP] ERROR: {exc}")
         except OSError as exc:
@@ -1261,6 +1269,25 @@ class _WFDRTSPHandler(socketserver.StreamRequestHandler):
             )
             print(f"[hyprcast WFD RTSP] Negotiated media mode: {mode.name}")
             print(f"[hyprcast WFD RTSP] Selected video format: {self._video_format()}")
+            if self.media_config.probe_only:
+                print()
+                print("=== what this sink is offering RIGHT NOW ===")
+                print(f"  wfd_video_formats: {params.get('wfd_video_formats', '(none)')}")
+                print(f"  wfd_audio_codecs : {params.get('wfd_audio_codecs', '(none)')}")
+                fmt = self.sink_video_format
+                if fmt is not None:
+                    modes = [m.name for bit, m in sorted(WFD_CEA_MODES.items())
+                             if fmt.cea_mask & bit]
+                    print(f"  CEA mask 0x{fmt.cea_mask:08x} -> "
+                          f"{', '.join(modes) if modes else 'nothing usable'}")
+                    sixty = any(m.endswith("p60") for m in modes)
+                    print()
+                    print(f"  60 fps available : {'YES' if sixty else 'NO'}")
+                    print(f"  would negotiate  : {mode.name}")
+                    if not sixty:
+                        print("  -> The TV is advertising a reduced set. Fully quit and")
+                        print("     re-open the Miracast app on the TV, then probe again.")
+                raise WFDProbeDone()
             self._send_m4_set_parameters()
         elif name == "M4_SET_PARAMETER":
             self._send_m5_trigger_setup()
@@ -1596,6 +1623,7 @@ class WFDRTSPServer:
         self._server: Optional[socketserver.ThreadingTCPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.has_connected_client = False
+        self.probe_done = False
         self._media_lock = threading.Lock()
         self._active_media: list[NativeSender] = []
 
@@ -2871,6 +2899,7 @@ def start_experimental_backend(args) -> None:
         fps=args.fps,
         bitrate=args.bitrate,
         output_resolution=args.output_res,
+        probe_only=bool(getattr(args, "probe_only", False)),
         audio_device=getattr(args, "wfd_audio_device", None),
         no_audio=getattr(args, "wfd_no_audio", False),
         source_port=getattr(args, "wfd_rtp_source_port", 19002),
@@ -2937,9 +2966,15 @@ def start_experimental_backend(args) -> None:
         )
         probe_thread.start()
 
-        print("[hyprcast WFD] Waiting for TV RTSP/WFD session. Press Ctrl+C to stop.")
+        if media_config.probe_only:
+            print("[hyprcast WFD] Probing: waiting for the sink to answer M3...")
+        else:
+            print("[hyprcast WFD] Waiting for TV RTSP/WFD session. Press Ctrl+C to stop.")
         while True:
             time.sleep(1)
+            if media_config.probe_only and getattr(rtsp, "probe_done", False):
+                print("[hyprcast WFD] Probe complete; tearing the link down.")
+                break
     except (KeyboardInterrupt, _SessionStop) as exc:
         reason = str(exc) or "Ctrl+C"
         print(f"\n[hyprcast WFD] Stopping WFD session ({reason})...")

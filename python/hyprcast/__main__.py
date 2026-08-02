@@ -247,6 +247,38 @@ def cmd_scan(args) -> int:
     return 0
 
 
+
+# ------------------------------------------------------------------ probe
+def cmd_probe(args) -> int:
+    """Connect, read M3, print what the sink is offering, and disconnect.
+
+    The P2P beacon a scan sees carries no mode table -- only device type,
+    availability, RTSP port and max throughput. Whether you can have 60 fps is
+    in the CEA mask, which arrives only in the M3 GET_PARAMETER response, after
+    a connection exists. This forms the link, asks, and tears it down without
+    ever starting the media path.
+    """
+    from . import wfd
+
+    ns = argparse.Namespace(
+        fps=args.fps, bitrate="8M", output_res=None, monitor_name=None,
+        wfd_interface=args.interface, wfd_timeout=args.timeout,
+        wfd_peer=args.sink, wfd_rtsp_port=7236, wfd_rtp_source_port=19002,
+        wfd_no_audio=True, wfd_audio_device=None, wfd_low_power=False,
+        wfd_qp=None, wfd_no_firewall=True, wfd_go_intent=None,
+        wfd_latency_log=None, wfd_dry_run=False, engine=None,
+        probe_only=True,
+    )
+    try:
+        wfd.start_experimental_backend(ns)
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    except wfd.WFDNotReady as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+
+
 # -------------------------------------------------------------------- ctl
 _CTL_VALUE_CMDS = {"fps", "bitrate", "volume", "monitor", "mode"}
 _CTL_NOARG_CMDS = {"status", "start", "stop", "list-outputs", "list-sinks", "quit"}
@@ -524,6 +556,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     wb = sub.add_parser("waybar", help="stream waybar JSON on stdout")
     wb.set_defaults(func=cmd_waybar)
+
+    probe = sub.add_parser("probe",
+                           help="ask the sink what it can do, without casting")
+    probe.add_argument("--interface", default="p2p-dev-wlan0")
+    probe.add_argument("--timeout", type=int, default=60)
+    probe.add_argument("--sink", metavar="MAC", default=None)
+    probe.add_argument("--fps", type=int, default=60)
+    probe.set_defaults(func=cmd_probe)
 
     scan = sub.add_parser("scan", help="look for sinks without casting")
     scan.add_argument("--interface", default="p2p-dev-wlan0")
