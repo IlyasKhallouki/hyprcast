@@ -57,7 +57,90 @@ full advertised list picks `Y_TILED_CCS`, which iHD refuses to import.
 
 ---
 
-## ⚠️ Project-kill gate — not yet run
+## Milestone 1B: the native path works
+
+`engine/build/hyprcast-bench` runs capture → VA import → VPP → h264_vaapi → Annex-B
+with the CPU never touching a pixel. Measured against a realistic load (mpv playing
+a 1080p60 hardware-decoded clip in a window), 1920x1080 capture → 1280x720p60 wire:
+
+| | capture p50 | vpp p50 | encode p50 | total p50 | fps | CPU |
+|---|---|---|---|---|---|---|
+| VBR / `EncSlice`   | 8.85 ms | 0.32 ms | 7.51 ms | 16.69 ms | **58.2** | 9.5% |
+| CQP / `EncSliceLP` | 12.24 ms | 0.38 ms | **3.98 ms** | 16.79 ms | **57.8** | **6.6%** |
+
+For comparison, fluxcast's current x264 path costs **197% of one core** for the same
+job. This is roughly a 20-30x reduction in CPU.
+
+Bitstream verified correct: Constrained Baseline, level 3.2, 1280x720,
+`has_b_frames=0`, bt709/tv, decodes with zero errors, 18 keyframes at the
+configured GOP. Colour checked against a `grim` screenshot (mean RGB within
+3/765) so the BGRX-vs-RGBX import is genuinely right, not accidentally symmetric.
+
+### VDEnc supports CQP only
+
+`--low-power` selects `VAEntrypointEncSliceLP`. On Gen9.5 that path accepts **CQP
+only** -- both CBR and VBR fail `avcodec_open2` with EINVAL, verified directly with
+ffmpeg for constrained_baseline and for main. That is a genuine trade-off, not a
+bug: VDEnc is a separate fixed-function block from the one hardware *decode* uses,
+so it stays fast while a video plays, but it cannot hold a bitrate target -- which
+is exactly what a Wi-Fi Direct link wants. Expose both, pick per session.
+
+### Still short of 59.5 fps
+
+Both paths land at ~58. The remaining cost is `capture` p50 8.8-12.2 ms: the
+compositor's own GL blit into our bo, which we do not control. Total p50 sits
+right at the 16.67 ms budget, so the loop is marginal rather than comfortable.
+
+Benchmarking note: `vkcube` is the WRONG load to measure against -- it saturates
+the same small GPU we are measuring, and produced misleading 39-52 fps numbers.
+Use a realistic load.
+
+### Pipelining
+
+The loop keeps one capture outstanding while the previous frame converts and
+encodes (`hc_capture_submit` / `hc_capture_wait`). The buffer being read by VPP is
+explicitly re-reserved before the next submit, or the compositor picks the same bo
+and overwrites it mid-read.
+
+`vaSyncSurface` after VPP is off by default (`HC_VPP_SYNC=1` restores it): it forces
+a CPU-GPU round-trip and VA-API already orders the encode behind the VPP.
+
+## Loopback harness: the TV is no longer needed
+
+`tools/rtsp-loopback-source.py` + `tools/mock-sink.py` replay the captured session
+locally. Verified: 9,301 datagrams, 65,107 TS packets, **0 lost / 0 reordered /
+0 duplicated / 0 malformed** over 21.5 s at 4.6 Mbit/s.
+
+`tools/assert-ts.py` validates the result -- all 12 checks pass, including
+"SPS+PPS immediately precede every IDR" (23 IDRs, all in band) and IDR interval
+1000.0 ms with zero jitter.
+
+It also answers the open PID question from the design doc:
+
+> ATSParser reads the PMT PID out of the PAT and the elementary PIDs out of the
+> PMT; it hardcodes nothing but PID 0. Any self-consistent layout parses.
+
+So the `wfd.py:880-882` warning about PID layout does not bind for Android sinks.
+
+---
+
+## ✅ Project-kill gate — PASSED
+
+Confirmed on 2026-08-02 with a real session that rendered on screen. The concern
+below was real but did not apply to this device -- Xiaomi's preinstalled app IS a
+genuine WFD sink.
+
+Discovery returned `wfd_dev_info=0x00111c440032` -> WFD **Primary Sink**, available
+for session, P2P preferred, RTSP control port 7236, 50 Mbps max throughput.
+
+Negotiated and confirmed working: **1280x720p60**, H.264 Constrained Baseline
+level 3.2, AAC 48 kHz 2ch, `wfd_content_protection: none` accepted.
+
+Session timeline from `reference/sink/wire-720p60-full-session.txt`: the complete
+M1-M6 negotiation costs **333 ms**; the sink then sits for **8.024 s** before
+sending PLAY. That stall is entirely sink-side.
+
+Original concern, kept because it explains why this had to be checked first:
 
 **Google TV ships no built-in Miracast sink.** AOSP dropped the
 `libstagefright/wifi-display` sink, and `WifiP2pManager.setWfdInfo()` is gated behind

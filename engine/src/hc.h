@@ -124,8 +124,36 @@ struct hc_frame {
  * ready/failed, or `timeout_ms` elapses. Returns 0 on success.
  * A timeout with neither ready nor failed is the Hyprland screencopy
  * permission prompt hanging -- surface it, do not retry silently.
+ *
+ * Equivalent to hc_capture_submit() immediately followed by hc_capture_wait().
+ * Convenient, but it CANNOT sustain 60 fps: VPP and encode then happen while
+ * no capture is outstanding, so the next vblank is missed. Measured 52.2 fps
+ * with a 17.3 ms serial p50 against a 16.67 ms budget. Use submit/wait.
  */
 int  hc_capture_frame(struct hc_capture *c, struct hc_frame *out, int timeout_ms);
+
+/*
+ * Pipelined capture. Keep one request in flight while the previous frame is
+ * being converted and encoded, so VPP+encode (~3.5 ms measured) hides inside
+ * the ~13 ms the compositor takes to produce the next frame:
+ *
+ *     hc_capture_submit(c, &tok);
+ *     for (;;) {
+ *         hc_capture_wait(c, tok, &frame, 2000);
+ *         hc_capture_submit(c, &next);   // BEFORE touching this frame
+ *         vpp(frame); encode(frame);     // now overlapped with capture
+ *         tok = next;
+ *     }
+ *
+ * Bounded by the pool size: at most n-1 may be outstanding, so a 3-buffer pool
+ * allows 2 in flight. submit returns -4 if none are free.
+ * The token stays valid until wait() consumes it.
+ */
+struct hc_inflight;
+
+int hc_capture_submit(struct hc_capture *c, struct hc_inflight **token);
+int hc_capture_wait(struct hc_capture *c, struct hc_inflight *token,
+                    struct hc_frame *out, int timeout_ms);
 /* True if the compositor re-sent buffer constraints; pool must be rebuilt. */
 bool hc_capture_constraints_changed(struct hc_capture *c);
 void hc_capture_close(struct hc_capture *c);
@@ -163,7 +191,11 @@ struct hc_enc_cfg {
     uint32_t fps;                /* 60 */
     uint32_t bitrate_bps;        /* VBR target */
     uint32_t gop;                /* frames between IDR */
-    bool     low_power;          /* VAEntrypointEncSliceLP -- Gen9.5 has it */
+    bool     low_power;          /* VAEntrypointEncSliceLP -- Gen9.5 has it.
+                                  * MEASURED: VDEnc on Gen9.5 accepts CQP ONLY;
+                                  * CBR and VBR fail avcodec_open2 with EINVAL.
+                                  * So low_power ignores bitrate_bps and uses qp. */
+    uint32_t qp;                 /* CQP quantiser when low_power; 0 => 26 */
 };
 
 /*
