@@ -18,7 +18,7 @@
     "return-type": "json",
     "restart-interval": 5,
     "tooltip": true,
-    "format": "{icon} {}",
+    "format": "{icon} {text}",
 
     // Font Awesome 4 codepoints. They exist in every Nerd Font, v2 and v3, and
     // unlike the Material Design set they have never been renumbered. Change

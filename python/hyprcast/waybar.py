@@ -90,6 +90,11 @@ def _tooltip(lines: list[str]) -> str:
 
 
 def _idle(reason: str = "") -> dict:
+    # NOT an empty string. waybar hides a custom module whose text is empty, so
+    # an idle module with "text": "" vanishes from the bar entirely and the
+    # format-icons glyph never gets a chance to render. A single space keeps the
+    # module alive and lets "{icon} {}" show the icon on its own. Verified on
+    # waybar with this exact config: "" disappears, " " shows the glyph.
     return {
         "text": "",
         "alt": "idle",
