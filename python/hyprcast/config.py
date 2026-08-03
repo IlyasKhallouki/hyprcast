@@ -310,7 +310,7 @@ fps = 60
 bitrate = "8M"
 mode = "mirror"          # mirror | extend
 monitor = ""             # "" = the first output
-audio = "device"         # shared | tv-only | none
+audio = "device"         # shared | tv-only | device | none
 volume = 100             # cast volume; 100 is unity, and the laptop's own
                          # sink volume is never touched
 low_power = false
