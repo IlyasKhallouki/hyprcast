@@ -118,6 +118,7 @@ SPEC: dict[str, dict[str, Field]] = {
         # monitor source carries -- and it never touches the laptop's own sink.
         "volume":      Field("int", 100, lo=0, hi=100),
         "low_power":   Field("bool", False),
+        "cursors":     Field("bool", True),
         "qp":          Field("int", None, lo=1, hi=51),
         "no_firewall": Field("bool", False),
         "width":       Field("int", 1280, lo=16, hi=7680),
@@ -313,6 +314,7 @@ audio = "shared"         # shared | tv-only | none
 volume = 100             # cast volume; 100 is unity, and the laptop's own
                          # sink volume is never touched
 low_power = false
+cursors = true           # composite the mouse pointer into the cast
 qp = 26                  # CQP quantiser; only read when low_power = true
 no_firewall = true       # firewall-cmd times out on this box
 width = 1280

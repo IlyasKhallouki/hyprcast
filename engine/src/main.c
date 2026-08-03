@@ -1014,6 +1014,14 @@ static int session_start(struct engine *e, const struct hc_ctl_msg *m)
     cfg.bitrate_bps = m->bitrate ? m->bitrate : 8000000;
     cfg.gop         = m->gop     ? m->gop     : cfg.fps;
     cfg.low_power   = m->has_low_power ? m->low_power : false;
+    /*
+     * Composite the pointer into the capture. Nothing ever set this before, so
+     * e->cursors was calloc'd false and create_session got options=0, which is
+     * "do not paint cursors" -- the cast showed no mouse at all. Someone
+     * watching a mirrored desktop needs to see where the pointer is, so this
+     * defaults ON when the control message omits it.
+     */
+    e->cursors      = m->has_cursors ? m->cursors : true;
     cfg.qp          = m->qp;
 
     if (cfg.fps > 240) {

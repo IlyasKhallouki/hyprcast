@@ -316,6 +316,7 @@ struct hc_ctl_msg {
     bool     has_gain;
     bool     muted, has_muted;
     bool     low_power, has_low_power;
+    bool     cursors, has_cursors;
 };
 
 struct hc_ctl *hc_ctl_open(int fd);

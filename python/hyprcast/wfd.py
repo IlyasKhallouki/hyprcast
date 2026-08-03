@@ -226,6 +226,7 @@ class WFDMediaConfig:
     monitor: Optional["Monitor"]
     fps: int = 60
     probe_only: bool = False
+    cursors: bool = True   # composite the pointer into the capture
     bitrate: str = "4M"
     output_resolution: Optional[str] = None
     audio_device: Optional[str] = None
@@ -919,6 +920,10 @@ class NativeSender:
             "bitrate": self.bitrate_kbits * 1000,
             "gop": gop,
             "low_power": self.config.low_power,
+            # Without this the sink shows no mouse pointer at all: the engine
+            # calls create_session with options=0, which is "do not paint
+            # cursors". Nothing used to set it, so it was always off.
+            "cursors": self.config.cursors,
         }
         if self.config.low_power and self.config.qp:
             params["qp"] = self.config.qp
@@ -3389,6 +3394,7 @@ def start_experimental_backend(args) -> None:
         bitrate=args.bitrate,
         output_resolution=args.output_res,
         probe_only=bool(getattr(args, "probe_only", False)),
+        cursors=bool(getattr(args, "cursors", True)),
         audio_device=getattr(args, "wfd_audio_device", None),
         no_audio=getattr(args, "wfd_no_audio", False),
         audio_mode=getattr(args, "wfd_audio_mode", None) or "shared",

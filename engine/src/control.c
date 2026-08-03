@@ -388,7 +388,7 @@ static bool is_scalar_key(const char *key)
 {
     static const char *const k[] = {
         "dst_port", "src_port", "width", "height", "fps",
-        "bitrate", "gop", "qp", "gain", "muted", "low_power",
+        "bitrate", "gop", "qp", "gain", "muted", "low_power", "cursors",
     };
     for (size_t i = 0; i < sizeof k / sizeof *k; i++)
         if (!strcmp(key, k[i]))
@@ -514,6 +514,9 @@ static int parse_line(const char *line, size_t len, struct hc_ctl_msg *out)
         } else if (!strcmp(key, "low_power")) {
             rc = want_bool(kind, num, bl, &out->low_power,
                            &out->has_low_power, key);
+        } else if (!strcmp(key, "cursors")) {
+            rc = want_bool(kind, num, bl, &out->cursors,
+                           &out->has_cursors, key);
         }
         if (rc != 0)
             return -1;
