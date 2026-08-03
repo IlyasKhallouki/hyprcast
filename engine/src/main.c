@@ -342,43 +342,61 @@ static void *cap_loop(void *arg)
     return NULL;
 }
 
-static int cap_start(struct capthread *ct, struct hc_capture *cap,
-                     struct hc_pool *pool)
+/*
+ * The capture thread is handed &ct and dereferences it for its whole life, so
+ * the struct must NEVER be copied or moved: it holds a pthread_mutex_t, and
+ * relocating it while the thread runs destroys the mutex under it. Copying it
+ * by value to retire or adopt a capture segfaulted the engine (exit -11), which
+ * is why it is heap allocated and passed around only as a pointer.
+ */
+static struct capthread *cap_start(struct hc_capture *cap, struct hc_pool *pool)
 {
-    memset(ct, 0, sizeof *ct);
+    struct capthread *ct = calloc(1, sizeof *ct);
+
+    if (!ct)
+        return NULL;
     ct->cap  = cap;
     ct->pool = pool;
     ct->frame_idx = -1;
 
     if (pthread_mutex_init(&ct->mu, NULL) != 0) {
         HC_ERR("pthread_mutex_init failed");
-        return -1;
+        free(ct);
+        return NULL;
     }
     if (pthread_create(&ct->th, NULL, cap_loop, ct) != 0) {
         HC_ERR("pthread_create(capture) failed: %s", strerror(errno));
         pthread_mutex_destroy(&ct->mu);
-        return -1;
+        free(ct);
+        return NULL;
     }
     ct->started = true;
-    return 0;
+    return ct;
 }
 
 static void cap_join(struct capthread *ct)
 {
-    if (!ct->started)
+    if (!ct)
         return;
+    if (!ct->started) {
+        free(ct);
+        return;
+    }
     pthread_mutex_lock(&ct->mu);
     ct->quit = true;
     pthread_mutex_unlock(&ct->mu);
     pthread_join(ct->th, NULL);
     pthread_mutex_destroy(&ct->mu);
     ct->started = false;
+    free(ct);
 }
 
 /* Take the newest ready buffer, if any. The caller owns it until cap_put(). */
 static bool cap_take(struct capthread *ct, int *idx, uint64_t *pres,
                      bool *have_pres)
 {
+    if (!ct)
+        return false;
     bool got;
 
     pthread_mutex_lock(&ct->mu);
@@ -398,6 +416,9 @@ static bool cap_has_frame(struct capthread *ct)
 {
     bool got;
 
+    if (!ct)
+        return false;
+
     pthread_mutex_lock(&ct->mu);
     got = ct->have_frame;
     pthread_mutex_unlock(&ct->mu);
@@ -406,7 +427,7 @@ static bool cap_has_frame(struct capthread *ct)
 
 static void cap_put(struct capthread *ct, int idx)
 {
-    if (idx < 0)
+    if (!ct || idx < 0)
         return;
     pthread_mutex_lock(&ct->mu);
     if (ct->n_release < HC_MAX_BUFS)
@@ -423,7 +444,7 @@ struct cap_status {
 static void cap_status(struct capthread *ct, struct cap_status *s)
 {
     memset(s, 0, sizeof *s);
-    if (!ct->started)
+    if (!ct || !ct->started)
         return;
     pthread_mutex_lock(&ct->mu);
     s->stopped      = ct->stopped;
@@ -454,7 +475,7 @@ struct engine {
     struct hc_enc     *enc;
     struct hc_mux     *mux;
     struct hc_audio   *audio;
-    struct capthread   ct;
+    struct capthread  *ct;
 
     /* Live audio state, kept HERE and not in hc_audio: a fresh audio leg opens
      * at unity and unmuted, so `ctl sink NAME` would otherwise undo a volume
@@ -495,7 +516,7 @@ struct engine {
     _Atomic bool       cap_pending_done;
     char               cap_pending_name[64];
     struct hc_capture *cap_pending;
-    struct capthread   ct_pending;
+    struct capthread  *ct_pending;
     bool               ct_pending_live;
     struct hc_pool     pool_pending;
     bool               pool_pending_live;
@@ -731,7 +752,8 @@ static int build_pool(struct engine *e)
 /* Tear down capture + pool only. The encoder, mux and audio keep running. */
 static void drop_capture(struct engine *e)
 {
-    cap_join(&e->ct);
+    cap_join(e->ct);
+    e->ct = NULL;
     e->hold_idx = -1;
     if (e->pool_live) {
         hc_pool_destroy(&e->pool);
@@ -764,7 +786,8 @@ static int make_capture(struct engine *e, const char *output)
         e->cap = NULL;
         return -1;
     }
-    if (cap_start(&e->ct, e->cap, &e->pool) != 0) {
+    e->ct = cap_start(e->cap, &e->pool);
+    if (!e->ct) {
         ev_error(e, "could not start the capture thread");
         hc_pool_destroy(&e->pool);
         e->pool_live = false;
@@ -794,7 +817,8 @@ static void session_stop(struct engine *e)
         e->cap_switching = false;
         if (e->cap_pending_rc == 0 && e->cap_pending) {
             if (e->ct_pending_live) {
-                cap_join(&e->ct_pending);
+                cap_join(e->ct_pending);
+                e->ct_pending = NULL;
                 e->ct_pending_live = false;
             }
             if (e->pool_pending_live) {
@@ -1123,9 +1147,9 @@ static int session_start(struct engine *e, const struct hc_ctl_msg *m)
         bool have_pres = false;
         struct cap_status st;
 
-        if (cap_take(&e->ct, &idx, &pres, &have_pres)) {
+        if (cap_take(e->ct, &idx, &pres, &have_pres)) {
             if (e->hold_idx >= 0 && e->hold_idx != idx)
-                cap_put(&e->ct, e->hold_idx);
+                cap_put(e->ct, e->hold_idx);
             e->hold_idx = idx;
             if (encode_slot(e, e->pool.buf[idx].va, false) != 0)
                 goto fail;
@@ -1134,7 +1158,7 @@ static int session_start(struct engine *e, const struct hc_ctl_msg *m)
             /* Encoded but nothing came out yet -- keep the grid moving. */
             e->pts_ns += e->interval_ns;
         }
-        cap_status(&e->ct, &st);
+        cap_status(e->ct, &st);
         if (st.fatal) {
             ev_error(e, "%s", st.err[0] ? st.err : "capture failed");
             goto fail;
@@ -1279,7 +1303,8 @@ static void *capture_open_thread(void *arg)
              * pacer. The swap then waits for this thread to have a frame in
              * hand, so hold_idx is never left pointing at nothing.
              */
-            if (cap_start(&e->ct_pending, e->cap_pending, &e->pool_pending) == 0) {
+            e->ct_pending = cap_start(e->cap_pending, &e->pool_pending);
+            if (e->ct_pending) {
                 e->ct_pending_live = true;
                 e->cap_pending_rc  = 0;
             } else {
@@ -1328,7 +1353,7 @@ static void *capture_open_thread(void *arg)
  * pointer assignments.
  */
 struct retiring {
-    struct capthread    ct;
+    struct capthread   *ct;
     struct hc_capture  *cap;
     struct hc_pool      pool;
     bool                pool_live;
@@ -1339,7 +1364,7 @@ static void *retire_thread(void *arg)
 {
     struct retiring *r = arg;
 
-    cap_join(&r->ct);
+    cap_join(r->ct);
     if (r->pool_live)
         hc_pool_destroy(&r->pool);
     if (r->gbm_fd >= 0)
@@ -1360,7 +1385,7 @@ static int retire_capture_async(struct engine *e)
     if (!r)
         return -1;
 
-    r->ct        = e->ct;
+    r->ct        = e->ct;   /* pointer: the thread's address never moves */
     r->cap       = e->cap;
     r->pool      = e->pool;
     r->pool_live = e->pool_live;
@@ -1368,7 +1393,8 @@ static int retire_capture_async(struct engine *e)
 
     /* The capture thread was handed &e->pool at cap_start; the pool has moved
      * into the bundle, so re-point it before the thread touches it again. */
-    r->ct.pool = &r->pool;
+    if (r->ct)
+        r->ct->pool = &r->pool;
 
     if (pthread_create(&tid, NULL, retire_thread, r) != 0) {
         free(r);
@@ -1376,7 +1402,7 @@ static int retire_capture_async(struct engine *e)
     }
     pthread_detach(tid);
 
-    memset(&e->ct, 0, sizeof e->ct);
+    e->ct = NULL;
     e->cap       = NULL;
     e->pool_live = false;
     e->gbm_fd    = -1;
@@ -1406,7 +1432,7 @@ static void capture_swap_if_ready(struct engine *e)
      * live, and only then do the pointers move.
      */
     if (e->cap_pending_rc == 0 && e->ct_pending_live &&
-        !cap_has_frame(&e->ct_pending)) {
+        !cap_has_frame(e->ct_pending)) {
         if (hc_now_ns() < e->cap_switch_deadline_ns)
             return;                     /* still warming up; try again next tick */
         HC_LOG("output: '%s' produced no frame in time; swapping anyway",
@@ -1447,9 +1473,10 @@ static void capture_swap_if_ready(struct engine *e)
     /* The capture thread is already running against this pool, started by the
      * opener; adopt it rather than starting a second one. */
     e->ct = e->ct_pending;
-    e->ct.pool = &e->pool;
+    if (e->ct)
+        e->ct->pool = &e->pool;
+    e->ct_pending      = NULL;
     e->ct_pending_live = false;
-    memset(&e->ct_pending, 0, sizeof e->ct_pending);
 
     snprintf(e->output, sizeof e->output, "%s", e->cap_pending_name);
     e->hold_idx  = -1;
@@ -1611,7 +1638,7 @@ static int handle_capture_state(struct engine *e)
 {
     struct cap_status st;
 
-    cap_status(&e->ct, &st);
+    cap_status(e->ct, &st);
     if (!st.stopped)
         return 0;
 
@@ -1655,7 +1682,7 @@ static void maybe_stats(struct engine *e)
            (double)(ru.ru_stime.tv_sec  - e->stat_ru.ru_stime.tv_sec) +
            (double)(ru.ru_stime.tv_usec - e->stat_ru.ru_stime.tv_usec) / 1e6) / secs;
 
-    cap_status(&e->ct, &cs);
+    cap_status(e->ct, &cs);
     snprintf(line, sizeof line,
              "{\"ev\":\"stats\",\"fps\":%.1f,\"kbps\":%.0f,\"cpu\":%.3f,"
              "\"drops\":%" PRIu64 ",\"idr\":%" PRIu64 ",\"repeats\":%" PRIu64
@@ -1768,9 +1795,9 @@ static void run(struct engine *e)
         if (!e->running)
             continue;
 
-        if (cap_take(&e->ct, &idx, &pres, &have_pres)) {
+        if (cap_take(e->ct, &idx, &pres, &have_pres)) {
             if (e->hold_idx >= 0 && e->hold_idx != idx)
-                cap_put(&e->ct, e->hold_idx);
+                cap_put(e->ct, e->hold_idx);
             e->hold_idx = idx;
             if (encode_slot(e, e->pool.buf[idx].va, false) != 0) {
                 session_stop(e);
