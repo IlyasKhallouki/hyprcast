@@ -29,12 +29,26 @@ from . import audio as audiomod
 from . import hypr
 from .engine import Engine, EngineError, engine_binary
 
-__all__ = ["Session", "SessionError", "parse_bitrate", "REPO_ROOT"]
+__all__ = ["Session", "SessionError", "parse_bitrate", "REPO_ROOT",
+           "MODES", "normalize_mode", "other_mode", "mode_label"]
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 STATES = ("idle", "discovering", "connecting", "casting", "error")
 MODES = ("mirror", "second-screen")
+
+# "extend" is what the waybar tooltip and every other desktop calls it; it is
+# spelled second-screen internally because that is what the mode has always
+# been called here. Both spellings are accepted everywhere a mode is taken.
+MODE_ALIASES = {
+    "mirror": "mirror",
+    "clone": "mirror",
+    "second-screen": "second-screen",
+    "second_screen": "second-screen",
+    "secondscreen": "second-screen",
+    "extend": "second-screen",
+    "extended": "second-screen",
+}
 
 DEFAULT_WIRE = (1280, 720)      # the Xiaomi sink's maximum; 1080p is not offered
 DEFAULT_FPS = 60
@@ -59,10 +73,40 @@ def parse_bitrate(value) -> int:
     return int(float(match.group(1)) * scale)
 
 
+def normalize_mode(value) -> str:
+    """Accept either spelling of a mode; raise on anything else."""
+    key = str(value or "").strip().lower()
+    if key not in MODE_ALIASES:
+        raise SessionError(f"mode must be one of {'|'.join(MODES)} (or 'extend')")
+    return MODE_ALIASES[key]
+
+
+def other_mode(value) -> str:
+    """The mode a toggle lands on."""
+    return "mirror" if normalize_mode(value) == "second-screen" else "second-screen"
+
+
+def mode_label(value) -> str:
+    """How a mode is spoken about in the UI."""
+    return "extend" if str(value) == "second-screen" else str(value or "mirror")
+
+
 def engine_path() -> str:
     """The native engine binary if it is built and executable, else ""."""
     candidate = engine_binary()
     return candidate if os.access(candidate, os.X_OK) else ""
+
+
+DEFAULT_VOLUME_STEP = 5
+
+
+def _step(msg: dict) -> int:
+    """The step of a volume-up/down, defaulting to 5 points."""
+    try:
+        value = int(msg.get("value") or DEFAULT_VOLUME_STEP)
+    except (TypeError, ValueError):
+        raise SessionError("volume step must be an integer") from None
+    return max(1, min(100, abs(value)))
 
 
 class Session:
@@ -154,10 +198,17 @@ class Session:
             "stop": self.stop,
             "fps": lambda: self.set_fps(msg.get("value")),
             "bitrate": lambda: self.set_bitrate(msg.get("value")),
+            "qp": lambda: self._retune(qp=int(msg.get("value") or 0)),
+            "idr": lambda: self._send({"cmd": "idr"}),
             "volume": lambda: self.set_volume(msg.get("value")),
             "mute": lambda: self.set_muted(msg.get("value", "toggle")),
             "monitor": lambda: self.set_monitor(msg.get("value")),
             "mode": lambda: self.set_mode(msg.get("value")),
+            # The bar-button set: no argument to look up, no state to guess.
+            "toggle-mode": lambda: self.set_mode(other_mode(self.mode)),
+            "toggle-mute": lambda: self.set_muted("toggle"),
+            "volume-up": lambda: self.set_volume(self.volume + _step(msg)),
+            "volume-down": lambda: self.set_volume(self.volume - _step(msg)),
             "quit": self.stop,
         }
         if cmd == "list-outputs":
@@ -180,12 +231,11 @@ class Session:
                   fps: int | None = None, bitrate=None, width: int | None = None,
                   height: int | None = None, audio_mode: str | None = None,
                   peer: str | None = None, dst_port: int | None = None,
-                  src_port: int | None = None, low_power: bool | None = None) -> None:
+                  src_port: int | None = None, low_power: bool | None = None,
+                  volume: int | None = None) -> None:
         with self._lock:
             if mode is not None:
-                if mode not in MODES:
-                    raise SessionError(f"mode must be one of {'|'.join(MODES)}")
-                self.mode = mode
+                self.mode = normalize_mode(mode)
             if monitor is not None:
                 self.monitor = monitor
             if fps is not None:
@@ -202,6 +252,10 @@ class Session:
                 if audio_mode not in ("shared", "tv-only", "none"):
                     raise SessionError("audio must be shared, tv-only or none")
                 self.audio_mode = audio_mode
+            if volume is not None:
+                # The configured default. start() applies it once the engine
+                # is up, because a fresh audio leg always opens at unity.
+                self.volume = max(0, min(100, int(volume)))
             if peer is not None:
                 self.peer = peer
             if dst_port is not None:
@@ -456,8 +510,7 @@ class Session:
 
     def set_mode(self, mode) -> None:
         with self._lock:
-            if mode not in MODES:
-                raise SessionError(f"mode must be one of {'|'.join(MODES)}")
+            mode = normalize_mode(mode)
             if mode == self.mode:
                 return
             self.mode = mode
@@ -468,10 +521,34 @@ class Session:
             try:
                 self.capture_output = self._bring_up_display()
                 self._send({"cmd": "output", "name": self.capture_output})
-            finally:
-                if old_headless is not None:
-                    try:
-                        old_headless.close()
-                    except hypr.HyprError:
-                        pass
+            except Exception:
+                # Capture may still be bound to the old output, so it must
+                # survive. Anything created on the way here is left registered
+                # in hypr's live set and reaped at exit instead.
+                self.mode = "second-screen" if mode == "mirror" else "mirror"
+                self._headless = old_headless
+                raise
+            self._retire_headless(old_headless)
             self._changed()
+
+    def _retire_headless(self, output) -> None:
+        """Destroy an output the engine has just been moved OFF of.
+
+        Never before the engine confirms the move. Destroying an output that
+        still has a capture session bound does not fail, it kills the
+        compositor: CScreenshareFrame::transform() dereferences
+        m_session->monitor() with no null check. If the engine will not
+        confirm, the output is left alone -- a phantom monitor until exit is a
+        nuisance, a dead Hyprland is the whole desktop.
+        """
+        if output is None:
+            return
+        engine = self._engine
+        if engine is not None and engine.is_alive() and not engine.sync():
+            print(f"hyprcast: engine did not confirm the capture switch; "
+                  f"leaving {output.name} in place until exit")
+            return
+        try:
+            output.close()
+        except hypr.HyprError:
+            pass

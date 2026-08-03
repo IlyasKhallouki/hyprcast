@@ -506,7 +506,8 @@ static int parse_line(const char *line, size_t len, struct hc_ctl_msg *out)
                 HC_ERR("'gain' must be a number");
                 rc = -1;
             } else {
-                out->gain = (float)num;
+                out->gain     = (float)num;
+                out->has_gain = true;
             }
         } else if (!strcmp(key, "muted")) {
             rc = want_bool(kind, num, bl, &out->muted, &out->has_muted, key);

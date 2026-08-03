@@ -80,6 +80,12 @@ struct zwp_linux_dmabuf_v1;
  * more than this. Below it, sample counting is the more stable of the two. */
 #define HC_AUDIO_RESYNC_NS 250000000ull
 
+/* How much of the sound server's start-up backlog is worth keeping. One AAC
+ * access unit is 21.3 ms, so this is under a frame: enough that the first
+ * encode does not have to wait for another read, little enough that the clock
+ * anchor is not dragged into the past by however long the device took to open. */
+#define HC_AUDIO_START_KEEP_NS 20000000ull
+
 static void log_av(const char *what, int err)
 {
     char msg[AV_ERROR_MAX_STRING_SIZE];
@@ -125,6 +131,7 @@ struct hc_audio {
     atomic_bool      muted;
     atomic_bool      stop;
     atomic_int       err;
+    atomic_bool      reanchor;       /* hc_audio_flush asked for a fresh origin */
 
     uint64_t         frames_out, drops;
     uint64_t         last_drop_log_ns;
@@ -275,6 +282,15 @@ static void drain_encoder(struct hc_audio *a)
     }
 }
 
+static inline float clipf(float v)
+{
+    if (v > 1.0f)
+        return 1.0f;
+    if (v < -1.0f)
+        return -1.0f;
+    return v;
+}
+
 /*
  * Convert HC_AAC_FRAME interleaved s16 sample frames into the encoder's planar
  * float layout, applying the live gain on the way. This is the only place the
@@ -303,9 +319,19 @@ static int encode_one(struct hc_audio *a)
         float *r = (float *)a->frame->data[1];
         const float scale = gain / 32768.0f;
 
-        for (int i = 0; i < HC_AAC_FRAME; i++) {
-            l[i] = (float)in[2 * i]     * scale;
-            r[i] = (float)in[2 * i + 1] * scale;
+        if (gain <= 1.0f) {
+            for (int i = 0; i < HC_AAC_FRAME; i++) {
+                l[i] = (float)in[2 * i]     * scale;
+                r[i] = (float)in[2 * i + 1] * scale;
+            }
+        } else {
+            /* Boost can leave full-scale input outside the encoder's -1..1
+             * domain. Hard-clip it here rather than hand the AAC encoder
+             * samples it is not specified for. */
+            for (int i = 0; i < HC_AAC_FRAME; i++) {
+                l[i] = clipf((float)in[2 * i]     * scale);
+                r[i] = clipf((float)in[2 * i + 1] * scale);
+            }
         }
     }
 
@@ -336,6 +362,13 @@ static int append_pcm(struct hc_audio *a, const uint8_t *data, int size)
     if (frames <= 0)
         return 0;
 
+    /* hc_audio_flush() ran on the control thread: throw away what was captured
+     * before it and start the clock again from this buffer. */
+    if (atomic_exchange_explicit(&a->reanchor, false, memory_order_relaxed)) {
+        a->pcm_frames  = 0;
+        a->have_anchor = false;
+    }
+
     if (a->pcm_frames + frames > a->pcm_cap) {
         int cap = a->pcm_frames + frames + HC_AAC_FRAME;
         int16_t *nb = realloc(a->pcm,
@@ -353,11 +386,32 @@ static int append_pcm(struct hc_audio *a, const uint8_t *data, int size)
 
     now = hc_now_ns();
     if (!a->have_anchor) {
-        /* This buffer was captured over the interval ending now. */
-        uint64_t span = (uint64_t)frames * 1000000000ull / HC_AUDIO_RATE;
+        /*
+         * The first read hands back everything the sound server buffered while
+         * the stream was being set up -- avformat_open_input, the AAC encoder,
+         * the whole of hc_audio_open. That PCM is real but STALE, and since the
+         * anchor is derived from it ("this buffer ended now"), keeping it puts
+         * every later timestamp that far in the past: measured 116.6 ms behind
+         * the PCR after a mid-session device switch, which fails assert-ts's
+         * 100 ms PTS/PCR check. Keep only the newest slice and start there.
+         */
+        uint64_t span;
+        int keep = (int)(HC_AUDIO_START_KEEP_NS * (uint64_t)HC_AUDIO_RATE
+                         / 1000000000ull);
+
+        if (a->pcm_frames > keep) {
+            int drop = a->pcm_frames - keep;
+            memmove(a->pcm, a->pcm + (size_t)drop * HC_AUDIO_CHANNELS,
+                    (size_t)keep * HC_AUDIO_CHANNELS * sizeof *a->pcm);
+            a->pcm_frames = keep;
+            HC_LOG("dropped %d frame(s) (%.1f ms) buffered while the device "
+                   "was opening", drop,
+                   (double)drop * 1000.0 / (double)HC_AUDIO_RATE);
+        }
+        span = (uint64_t)a->pcm_frames * 1000000000ull / HC_AUDIO_RATE;
         a->anchor_ns   = now > span ? now - span : 0;
         a->have_anchor = true;
-        a->captured    = frames;
+        a->captured    = (uint64_t)a->pcm_frames;
         return 0;
     }
 
@@ -426,6 +480,11 @@ struct hc_audio *hc_audio_open(const struct hc_audio_cfg *cfg)
     const AVInputFormat *ifmt;
     const AVCodec *codec;
     AVDictionary *opts = NULL;
+    /* Read the caller's device BEFORE a->cfg.device is cleared below. It used
+     * to be read after, which is always NULL, so every session silently
+     * captured `pactl get-default-sink`.monitor no matter what it was asked
+     * for -- invisible until something asked for a different source. */
+    const char *want = cfg ? cfg->device : NULL;
     uint32_t bitrate;
     int err;
 
@@ -443,6 +502,7 @@ struct hc_audio *hc_audio_open(const struct hc_audio_cfg *cfg)
     atomic_init(&a->muted, false);
     atomic_init(&a->stop, false);
     atomic_init(&a->err, 0);
+    atomic_init(&a->reanchor, false);
 
     if (pthread_mutex_init(&a->lock, NULL) != 0) {
         HC_ERR("pthread_mutex_init failed");
@@ -450,8 +510,8 @@ struct hc_audio *hc_audio_open(const struct hc_audio_cfg *cfg)
         return NULL;
     }
 
-    if (a->cfg.device && *a->cfg.device) {
-        a->device = strdup(a->cfg.device);
+    if (want && *want) {
+        a->device = strdup(want);
     } else {
         a->device = default_monitor_name();
         if (!a->device) {
@@ -652,6 +712,52 @@ void hc_audio_set_muted(struct hc_audio *a, bool muted)
     if (!a)
         return;
     atomic_store_explicit(&a->muted, muted, memory_order_relaxed);
+}
+
+/* ----------------------------------------------------------------- flush */
+
+/*
+ * Drop queued access units older than `floor_ns`; return how many survive.
+ *
+ * This is what makes a device change seamless, and the return value is what
+ * makes it safe to act on. A replacement leg is opened while the old one is
+ * still feeding the muxer, and for the first ~90 ms it has NOTHING queued:
+ * MEASURED, the device, one fragment, 1024 samples and the encoder's own frame
+ * of delay all have to happen before it can speak. Swapping into that silence
+ * is what left a 95 ms hole in the stream, and a hole is what makes
+ * libavformat's interleaver hold video back and put the next access unit past
+ * assert-ts's 100 ms PTS/PCR limit.
+ *
+ * So the caller waits until this returns non-zero: the cut is then made exactly
+ * at the last timestamp already sent, and the two legs join with neither a gap
+ * nor an overlap -- one sample-boundary discontinuity, which is what changing
+ * sound device sounds like anyway.
+ *
+ * Pass 0 to drop everything queued and re-anchor the clock at the next buffer.
+ */
+int hc_audio_flush(struct hc_audio *a, uint64_t floor_ns)
+{
+    int kept;
+
+    if (!a)
+        return 0;
+
+    pthread_mutex_lock(&a->lock);
+    if (floor_ns == 0) {
+        a->head = a->tail = a->count = 0;
+    } else {
+        while (a->count > 0 && a->ring[a->head].pts_ns < floor_ns) {
+            a->head = (a->head + 1) % HC_AUDIO_RING;
+            a->count--;
+        }
+    }
+    kept = a->count;
+    pthread_mutex_unlock(&a->lock);
+
+    if (floor_ns == 0)
+        /* The capture thread owns pcm/anchor, so it does the reset itself. */
+        atomic_store_explicit(&a->reanchor, true, memory_order_relaxed);
+    return kept;
 }
 
 /* ----------------------------------------------------------------- close */

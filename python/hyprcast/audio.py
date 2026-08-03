@@ -26,6 +26,20 @@ Two honest caveats, neither flaky but both worth knowing:
     original default, not to their pin. That is the only fidelity loss.
   * Object indices are recycled across module loads (measured: sink index went
     876 -> 886 for the same sink_name). Everything here resolves by NAME.
+
+CRASHES. The one failure that is unforgivable here is leaving the user's
+speakers dead, so the route is recorded to $XDG_RUNTIME_DIR/hyprcast-audio.json
+BEFORE the module is loaded, not after. Three layers undo it:
+
+  1. NullSinkRoute.close(), from the session teardown paths -- idempotent.
+  2. recover_route(), called at the start of every cast: if the file is still
+     there, a previous run died without cleaning up, so restore its default
+     sink and unload the module now.
+  3. A stale `hyprcast` sink with no state file at all is still unloaded by
+     name, because a null sink nobody owns is never something the user wanted.
+
+Restore order is always: default sink back FIRST, then move the strays, then
+unload. Unloading first would strand every stream that was still parked on it.
 """
 
 from __future__ import annotations
@@ -43,6 +57,9 @@ __all__ = [
     "default_monitor_source",
     "resolve_monitor",
     "NullSinkRoute",
+    "recover_route",
+    "cleanup_stale_null_sink",
+    "state_path",
 ]
 
 NULL_SINK_NAME = "hyprcast"
@@ -176,6 +193,120 @@ def _sink_name_by_index(index: int) -> str:
     return ""
 
 
+def _owner_module(sink_name: str) -> str:
+    """The module id that owns a sink, by NAME. Empty string if there is none."""
+    try:
+        for raw in _pactl_json(["list", "sinks"]):
+            if raw.get("name") != sink_name:
+                continue
+            owner = raw.get("owner_module")
+            if isinstance(owner, int) and 0 <= owner < 0xFFFFFFFF:
+                return str(owner)
+    except AudioError:
+        pass
+    return ""
+
+
+def state_path() -> str:
+    return os.path.join(runtime_dir(), "hyprcast-audio.json")
+
+
+def _write_state(sink_name: str, prev_default: str) -> None:
+    """Record the route before it exists, so a SIGKILL still leaves a trail."""
+    try:
+        tmp = state_path() + ".tmp"
+        with open(tmp, "w") as handle:
+            json.dump({"sink": sink_name, "prev_default": prev_default}, handle)
+        os.replace(tmp, state_path())
+    except OSError:
+        pass
+
+
+def _clear_state() -> None:
+    try:
+        os.unlink(state_path())
+    except OSError:
+        pass
+
+
+def _restore(sink_name: str, prev_default: str) -> None:
+    """
+    Undo a null-sink route. Never raises: every caller is a teardown path.
+
+    Order is load-bearing. The default sink goes back first so anything that
+    starts playing during the restore lands on the speakers, then whatever is
+    still parked on the null sink is moved off it, and only then is the module
+    unloaded -- the reverse of how it was set up.
+    """
+    if prev_default:
+        try:
+            _pactl(["set-default-sink", prev_default])
+        except AudioError:
+            pass
+        try:
+            target_index = -1
+            for sink in list_sinks():
+                if sink.name == sink_name:
+                    target_index = sink.index
+            if target_index >= 0:
+                for stream, sink_index in _sink_inputs():
+                    if sink_index == target_index:
+                        try:
+                            _pactl(["move-sink-input", str(stream), prev_default])
+                        except AudioError:
+                            continue
+        except AudioError:
+            pass
+
+    module_id = _owner_module(sink_name)
+    if module_id:
+        try:
+            _pactl(["unload-module", module_id])
+        except AudioError:
+            pass
+
+
+def recover_route(name: str = NULL_SINK_NAME) -> str:
+    """
+    Undo a route left behind by a session that died without cleaning up.
+
+    Returns a human-readable description of what was undone, or "" if there was
+    nothing to undo. Safe to call unconditionally at the start of every cast.
+    """
+    prev_default = ""
+    had_state = False
+    try:
+        with open(state_path()) as handle:
+            saved = json.load(handle)
+        had_state = True
+        if isinstance(saved, dict):
+            name = str(saved.get("sink") or name)
+            prev_default = str(saved.get("prev_default") or "")
+    except (OSError, ValueError):
+        pass
+
+    present = _owner_module(name) != ""
+    if not present and not had_state:
+        return ""
+
+    if present:
+        _restore(name, prev_default)
+    elif prev_default:
+        # The sink is already gone but the default may still point at nothing
+        # useful; putting it back costs one call and cannot make things worse.
+        try:
+            if default_sink() != prev_default:
+                _pactl(["set-default-sink", prev_default])
+        except AudioError:
+            pass
+    _clear_state()
+
+    if not present:
+        return f"cleared stale audio state (default sink -> {prev_default or 'unchanged'})"
+    return (f"unloaded the leftover {name!r} null sink"
+            + (f" and restored {prev_default} as the default" if prev_default else ""))
+
+
 class NullSinkRoute:
     """
     A dedicated null sink so cast audio reaches the TV ONLY.
@@ -197,7 +328,22 @@ class NullSinkRoute:
             self._prev_default = ""
 
         # A stale sink from a crashed session would shadow ours; drop it first.
-        self._unload_stale()
+        # Its own recorded prev_default wins over ours -- if a previous run
+        # already made the null sink the default, `default_sink()` above just
+        # read that null sink back and restoring it would be a no-op.
+        recovered = recover_route(name)
+        if recovered and self._prev_default == name:
+            try:
+                self._prev_default = default_sink()
+            except AudioError:
+                self._prev_default = ""
+        if self._prev_default == name:
+            self._prev_default = ""
+
+        # Recorded BEFORE the module exists: a crash between these two calls
+        # leaves a state file naming a sink that was never loaded, which
+        # recover_route() handles, whereas the reverse strands the sink.
+        _write_state(name, self._prev_default)
 
         args = [
             "load-module", "module-null-sink",
@@ -208,8 +354,13 @@ class NullSinkRoute:
             "audio.position=FL,FR",
             f"sink_properties=device.description=hyprcast",
         ]
-        module_id = _pactl(args)
+        try:
+            module_id = _pactl(args)
+        except AudioError:
+            _clear_state()
+            raise
         if not module_id.isdigit():
+            _clear_state()
             raise AudioError(f"module-null-sink did not return a module id: {module_id!r}")
         self._module_id = module_id
 
@@ -218,19 +369,22 @@ class NullSinkRoute:
             self.close()
             raise AudioError(f"null sink {name!r} loaded but exposes no monitor source")
 
-    def _unload_stale(self) -> None:
-        for sink in list_sinks():
-            if sink.name != self.name:
-                continue
-            owner = None
-            for raw in _pactl_json(["list", "sinks"]):
-                if raw.get("name") == self.name:
-                    owner = raw.get("owner_module")
-            if isinstance(owner, int) and 0 <= owner < 0xFFFFFFFF:
-                try:
-                    _pactl(["unload-module", str(owner)])
-                except AudioError:
-                    pass
+        # MEASURED, and it costs 11 dB if it is skipped: WirePlumber restores a
+        # remembered per-device volume by NAME, so a freshly loaded `hyprcast`
+        # sink came up at 65% from some earlier session and its monitor read
+        # 2305 RMS where the laptop's own monitor read 8484 for the same tone.
+        # The engine's gain is supposed to be the only thing between the
+        # desktop and the sink, so pin this one at unity.
+        for setter, arg in ((set_sink_volume, 100), (set_sink_mute, False)):
+            try:
+                setter(name, arg)     # type: ignore[operator]
+            except AudioError:
+                pass
+
+    @property
+    def previous_default(self) -> str:
+        """The sink that was default when this route was created."""
+        return self._prev_default
 
     def capture_all(self, set_default: bool = True) -> int:
         """Move every current playback stream onto the null sink. Returns count."""
@@ -256,35 +410,18 @@ class NullSinkRoute:
         return moved
 
     def close(self) -> None:
+        """Put the system back. Idempotent, and it never raises."""
         if not self._module_id:
+            _clear_state()
             return
-        module_id, self._module_id = self._module_id, ""
-
-        if self._prev_default:
-            try:
-                _pactl(["set-default-sink", self._prev_default])
-            except AudioError:
-                pass
-
-        # Anything still parked on the null sink goes back to the old default,
-        # otherwise unloading the module would silently strand it.
-        if self._prev_default:
-            try:
-                target_index = -1
-                for sink in list_sinks():
-                    if sink.name == self.name:
-                        target_index = sink.index
-                for stream, sink_index in _sink_inputs():
-                    if sink_index == target_index:
-                        _pactl(["move-sink-input", str(stream), self._prev_default])
-            except AudioError:
-                pass
-
-        try:
-            _pactl(["unload-module", module_id])
-        except AudioError:
-            pass
+        self._module_id = ""
         self.monitor_source = ""
+        # Resolve the module by NAME rather than reusing the id we loaded:
+        # indices are recycled, and unloading a recycled id would take down
+        # something that is not ours.
+        _restore(self.name, self._prev_default)
+        self._moved.clear()
+        _clear_state()
 
     def __enter__(self) -> "NullSinkRoute":
         return self
@@ -295,18 +432,12 @@ class NullSinkRoute:
 
 
 def cleanup_stale_null_sink(name: str = NULL_SINK_NAME) -> bool:
-    """Drop a hyprcast null sink left behind by a crashed session."""
-    try:
-        for raw in _pactl_json(["list", "sinks"]):
-            if raw.get("name") != name:
-                continue
-            owner = raw.get("owner_module")
-            if isinstance(owner, int) and 0 <= owner < 0xFFFFFFFF:
-                _pactl(["unload-module", str(owner)])
-                return True
-    except AudioError:
-        pass
-    return False
+    """Drop a hyprcast null sink left behind by a crashed session.
+
+    Kept for callers that only want the boolean; recover_route() is the one to
+    use, because it also puts the default sink back.
+    """
+    return bool(recover_route(name))
 
 
 def runtime_dir() -> str:

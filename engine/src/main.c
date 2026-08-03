@@ -49,7 +49,9 @@
  *    and nothing else -- the mux, the socket and the RTP sequence space survive
  *    -- and the next frame is forced to IDR so the fresh SPS/PPS reach the sink
  *    in band; "output" rebuilds capture and the pool against a different
- *    wl_output while VPP keeps scaling to the same frozen wire size.
+ *    wl_output while VPP keeps scaling to the same frozen wire size; "audio"
+ *    reopens the audio leg against another pulse source, and because the AAC
+ *    parameters and PID 0x1100 are unchanged the sink cannot tell.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -60,6 +62,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -93,6 +96,8 @@
 #define HC_QUARANTINE_NS   1000000000ull /* forced reclaim of a parked buffer */
 #define HC_PTS_RING        32
 #define HC_AUDIO_PER_TICK  32
+#define HC_AUDIO_BITRATE   128000u       /* what the sink accepted as AAC 00000001 */
+#define HC_GAIN_MAX        4.0f          /* hc_audio_set_volume clamps here too */
 #define HC_EXTRADATA_MAX   256
 
 #define HC_LOG(...)  do {                     \
@@ -440,6 +445,20 @@ struct engine {
     struct hc_audio   *audio;
     struct capthread   ct;
 
+    /* Live audio state, kept HERE and not in hc_audio: a fresh audio leg opens
+     * at unity and unmuted, so `ctl sink NAME` would otherwise undo a volume
+     * the user set ten seconds earlier. */
+    float    gain;
+    bool     muted;
+    uint64_t last_audio_pts;     /* last access unit handed to the muxer */
+
+    /* An audio source change in flight. See cmd_audio(). */
+    bool         aud_switching;
+    pthread_t    aud_open_tid;
+    _Atomic bool aud_pending_done;
+    struct hc_audio *aud_pending;
+    char         aud_pending_dev[128];
+
     /* frozen session parameters */
     char     output[64];
     char     audio_dev[128];
@@ -455,6 +474,20 @@ struct engine {
     uint32_t since_idr;
     bool     force_idr;
     int      hold_idx;           /* the buffer a repeat frame re-converts */
+
+    /*
+     * Pending capture, built off the main loop so the CFR pacer keeps feeding
+     * the muxer while a new output is opened. See cmd_output().
+     */
+    pthread_t          cap_open_tid;
+    bool               cap_switching;
+    _Atomic bool       cap_pending_done;
+    char               cap_pending_name[64];
+    struct hc_capture *cap_pending;
+    struct hc_pool     pool_pending;
+    bool               pool_pending_live;
+    int                gbm_fd_pending;
+    int                cap_pending_rc;
     bool     ready_sent;
 
     uint64_t pts_ring[HC_PTS_RING];
@@ -610,9 +643,10 @@ static int pick_mods(const struct hc_capture_caps *caps, uint64_t *mods, int max
     return n > 0 ? n : -1;
 }
 
-static int build_pool(struct engine *e)
+static int build_pool_into(struct engine *e, struct hc_capture *cap,
+                           struct hc_pool *pool, bool *pool_live, int *gbm_fd)
 {
-    const struct hc_capture_caps *caps = hc_capture_caps(e->cap);
+    const struct hc_capture_caps *caps = hc_capture_caps(cap);
     uint64_t mods[HC_MAX_MODS];
     int nmods;
     char fb[5];
@@ -644,35 +678,40 @@ static int build_pool(struct engine *e)
      * reliable. hc_pool_destroy() deliberately leaves the fd open, so
      * drop_capture() closes it.
      */
-    e->gbm_fd = open(HC_DRM_NODE, O_RDWR | O_CLOEXEC);
-    if (e->gbm_fd < 0) {
+    *gbm_fd = open(HC_DRM_NODE, O_RDWR | O_CLOEXEC);
+    if (*gbm_fd < 0) {
         ev_error(e, "open %s: %s", HC_DRM_NODE, strerror(errno));
         return -1;
     }
-    if (hc_pool_create(&e->pool, e->gbm_fd, hc_capture_dmabuf(e->cap),
+    if (hc_pool_create(pool, *gbm_fd, hc_capture_dmabuf(cap),
                        caps->width, caps->height, caps->fourcc,
                        mods, nmods, HC_POOL_BUFS) != 0) {
         ev_error(e, "hc_pool_create %ux%u failed", caps->width, caps->height);
-        close(e->gbm_fd);
-        e->gbm_fd = -1;
+        close(*gbm_fd);
+        *gbm_fd = -1;
         return -1;
     }
-    e->pool_live = true;
-    hc_capture_set_pool(e->cap, &e->pool);
+    *pool_live = true;
+    hc_capture_set_pool(cap, pool);
 
-    if (hc_va_import_pool(e->va, &e->pool) != 0) {
+    if (hc_va_import_pool(e->va, pool) != 0) {
         ev_error(e, "hc_va_import_pool failed");
-        hc_pool_destroy(&e->pool);
-        e->pool_live = false;
-        close(e->gbm_fd);
-        e->gbm_fd = -1;
+        hc_pool_destroy(pool);
+        *pool_live = false;
+        close(*gbm_fd);
+        *gbm_fd = -1;
         return -1;
     }
 
     HC_LOG("capture %ux%u -> wire %ux%u, %d buffer(s) modifier %s",
-           e->pool.width, e->pool.height, e->ecfg.width, e->ecfg.height,
-           e->pool.n, hc_mod_str(e->pool.buf[0].modifier));
+           pool->width, pool->height, e->ecfg.width, e->ecfg.height,
+           pool->n, hc_mod_str(pool->buf[0].modifier));
     return 0;
+}
+
+static int build_pool(struct engine *e)
+{
+    return build_pool_into(e, e->cap, &e->pool, &e->pool_live, &e->gbm_fd);
 }
 
 /* Tear down capture + pool only. The encoder, mux and audio keep running. */
@@ -732,6 +771,37 @@ static void session_stop(struct engine *e)
 
     HC_LOG("session stopping");
     drop_capture(e);
+
+    /* An output switch may still be opening a capture. Join it first, then
+     * discard whatever it produced: the session is going away regardless, and
+     * leaving the thread running would let it touch freed state. */
+    if (e->cap_switching) {
+        pthread_join(e->cap_open_tid, NULL);
+        e->cap_switching = false;
+        if (e->cap_pending_rc == 0 && e->cap_pending) {
+            if (e->pool_pending_live) {
+                hc_pool_destroy(&e->pool_pending);
+                e->pool_pending_live = false;
+            }
+            if (e->gbm_fd_pending >= 0) {
+                close(e->gbm_fd_pending);
+                e->gbm_fd_pending = -1;
+            }
+            hc_capture_close(e->cap_pending);
+            e->cap_pending = NULL;
+        }
+    }
+
+    /* An audio source change may still be opening a device. Join it before
+     * anything it could be swapped into is torn down. */
+    if (e->aud_switching) {
+        pthread_join(e->aud_open_tid, NULL);
+        e->aud_switching = false;
+        if (e->aud_pending) {
+            hc_audio_close(e->aud_pending);
+            e->aud_pending = NULL;
+        }
+    }
 
     if (e->audio) {
         hc_audio_close(e->audio);
@@ -908,6 +978,8 @@ static void drain_audio(struct engine *e)
                 HC_ERR("hc_mux_audio failed; stopping the audio drain");
                 return;
             }
+            /* Where a replacement leg has to pick up from. */
+            e->last_audio_pts = pts;
             e->stat_bytes += (uint64_t)size;
         }
     }
@@ -988,12 +1060,18 @@ static int session_start(struct engine *e, const struct hc_ctl_msg *m)
     }
 
     if (e->audio_dev[0]) {
-        struct hc_audio_cfg acfg = { e->audio_dev, 128000 };
+        struct hc_audio_cfg acfg = { e->audio_dev, HC_AUDIO_BITRATE };
         e->audio = hc_audio_open(&acfg);
         if (!e->audio) {
             ev_error(e, "hc_audio_open('%s') failed", e->audio_dev);
             goto fail;
         }
+        /* A session always begins at unity and unmuted; the control plane
+         * applies its configured default right after "ready". */
+        e->gain  = 1.0f;
+        e->muted = false;
+        hc_audio_set_volume(e->audio, e->gain);
+        hc_audio_set_muted(e->audio, e->muted);
     }
 
     /* The grid shares hc_now_ns() with the audio thread's timestamps, so video
@@ -1145,6 +1223,94 @@ static void cmd_retune(struct engine *e, const struct hc_ctl_msg *m)
         e->ecfg = cfg;
 }
 
+/*
+ * WHY THIS IS A THREAD, same reasoning as audio_open_thread below.
+ *
+ * cmd_output used to drop_capture() then make_capture() inline on the main
+ * loop. The pacer runs on that loop, so nothing reached the muxer for however
+ * long a Wayland connect, a 4-buffer GBM pool and a VA import took. MEASURED
+ * against the loopback harness across one mirror->extend->mirror round trip:
+ * PAT/PMT intervals of 140.8 ms and 322.7 ms and PCR gaps of 216.7 ms and
+ * 366.7 ms, against assert-ts's 100 ms limit, plus 33 dropped frames. A sink
+ * is entitled to drop a session over that.
+ *
+ * So the new capture is opened on its own thread while the OLD one stays live.
+ * The pacer keeps re-converting hold_idx out of the old pool, which is exactly
+ * why the old pool must not be freed first. Create before destroy.
+ */
+static void *capture_open_thread(void *arg)
+{
+    struct engine *e = arg;
+    const char *want = e->cap_pending_name[0] ? e->cap_pending_name : NULL;
+
+    e->cap_pending_rc = -1;
+    e->cap_pending = hc_capture_open(want, e->cursors);
+    if (e->cap_pending) {
+        if (build_pool_into(e, e->cap_pending, &e->pool_pending,
+                            &e->pool_pending_live, &e->gbm_fd_pending) == 0) {
+            e->cap_pending_rc = 0;
+        } else {
+            hc_capture_close(e->cap_pending);
+            e->cap_pending = NULL;
+        }
+    }
+    atomic_store_explicit(&e->cap_pending_done, true, memory_order_release);
+    return NULL;
+}
+
+/*
+ * Install a capture that finished opening. Runs on the main loop, between
+ * pacer ticks, so the swap itself is the only moment without a capture and it
+ * costs a cap_join plus a few frees.
+ *
+ * On failure the OLD capture is left exactly as it was and the session keeps
+ * running. Killing a working cast because someone typo'd an output name would
+ * be a poor trade.
+ */
+static void capture_swap_if_ready(struct engine *e)
+{
+    if (!e->cap_switching ||
+        !atomic_load_explicit(&e->cap_pending_done, memory_order_acquire))
+        return;
+
+    pthread_join(e->cap_open_tid, NULL);
+    e->cap_switching = false;
+    atomic_store_explicit(&e->cap_pending_done, false, memory_order_release);
+
+    if (e->cap_pending_rc != 0) {
+        ev_error(e, "output '%s' could not be captured; staying on '%s'",
+                 e->cap_pending_name[0] ? e->cap_pending_name : "<first output>",
+                 e->output[0] ? e->output : "<first output>");
+        return;
+    }
+
+    drop_capture(e);                    /* only now is the old one released */
+
+    e->cap       = e->cap_pending;
+    e->pool      = e->pool_pending;
+    e->pool_live = e->pool_pending_live;
+    e->gbm_fd    = e->gbm_fd_pending;
+    e->cap_pending = NULL;
+    e->pool_pending_live = false;
+    e->gbm_fd_pending = -1;
+
+    /* hc_pool_create stored the address of pool_pending in the session; the
+     * pool moved, so re-point it before a frame is attached to a stale one. */
+    hc_capture_set_pool(e->cap, &e->pool);
+
+    if (cap_start(&e->ct, e->cap, &e->pool) != 0) {
+        ev_error(e, "could not start the capture thread after switching output");
+        session_stop(e);
+        return;
+    }
+
+    snprintf(e->output, sizeof e->output, "%s", e->cap_pending_name);
+    e->hold_idx  = -1;
+    e->force_idr = true;                /* the picture changed */
+    HC_LOG("output: now capturing '%s'",
+           e->output[0] ? e->output : "<first output>");
+}
+
 static void cmd_output(struct engine *e, const struct hc_ctl_msg *m)
 {
     char want[sizeof e->output];
@@ -1155,20 +1321,140 @@ static void cmd_output(struct engine *e, const struct hc_ctl_msg *m)
     }
     snprintf(want, sizeof want, "%s", m->s_output);
 
-    HC_LOG("output: rebuilding capture against '%s'",
-           want[0] ? want : "<first output>");
-    drop_capture(e);
-
-    if (make_capture(e, want) != 0) {
-        ev_error(e, "output '%s' could not be captured; session stopping",
-                 want[0] ? want : "<first output>");
-        session_stop(e);
+    if (e->cap_switching) {
+        ev_error(e, "an output switch is already in progress");
         return;
     }
-    snprintf(e->output, sizeof e->output, "%s", want);
+
+    HC_LOG("output: opening '%s' alongside the live capture",
+           want[0] ? want : "<first output>");
+    snprintf(e->cap_pending_name, sizeof e->cap_pending_name, "%s", want);
+    e->cap_pending      = NULL;
+    e->pool_pending_live = false;
+    e->gbm_fd_pending   = -1;
+    atomic_store_explicit(&e->cap_pending_done, false, memory_order_release);
+
+    if (pthread_create(&e->cap_open_tid, NULL, capture_open_thread, e) != 0) {
+        ev_error(e, "could not start the output-switch thread");
+        return;
+    }
+    e->cap_switching = true;
     /* The wire size is frozen, so VPP absorbs the new capture geometry and the
-     * encoder never notices. Force an IDR anyway: the picture changed. */
-    e->force_idr = true;
+     * encoder never notices the change when the swap lands. */
+}
+
+/*
+ * Reopen the audio leg against a different pulse source. Only the audio leg:
+ * the encoder, the muxer, the RTP socket and the sequence space are all
+ * untouched, so the sink never learns the desktop changed sound card.
+ *
+ * WHY THIS IS A THREAD. hc_audio_open() takes ~120 ms -- avformat_open_input on
+ * the pulse device, then the AAC encoder. Doing that inline stops the audio
+ * stream for that long, and libavformat's interleaver then holds VIDEO back
+ * waiting for the missing audio (max_interleave_delta is 2 s, and it has to be:
+ * see mux.c). MEASURED against the loopback harness: a 120 ms audio hole put
+ * the first access unit after it 118 ms behind the PCR at its byte offset and
+ * failed assert-ts's 100 ms PTS/PCR check, twice per switch.
+ *
+ * So the replacement is opened on its own thread while the OLD leg keeps
+ * feeding the muxer -- create before destroy, the rule this whole engine runs
+ * on -- and the swap happens in one tick of the main loop once it is ready.
+ */
+static void *audio_open_thread(void *arg)
+{
+    struct engine *e = arg;
+    struct hc_audio_cfg acfg = { e->aud_pending_dev, HC_AUDIO_BITRATE };
+
+    e->aud_pending = hc_audio_open(&acfg);
+    atomic_store_explicit(&e->aud_pending_done, true, memory_order_release);
+    return NULL;
+}
+
+static void cmd_audio(struct engine *e, const struct hc_ctl_msg *m)
+{
+    if (!e->running) {
+        ev_error(e, "audio with no session running");
+        return;
+    }
+    if (!e->audio) {
+        /* The mux was opened without an audio stream; there is no PID 0x1100
+         * to feed and the sink was told so in the M4 SET_PARAMETER. */
+        ev_error(e, "this session has no audio leg -- it was started without "
+                    "one, and the sink cannot be told about a new stream mid-session");
+        return;
+    }
+    if (!m->s_audio[0]) {
+        ev_error(e, "audio needs a source name");
+        return;
+    }
+    if (e->aud_switching) {
+        ev_error(e, "an audio source change is already in flight");
+        return;
+    }
+    if (!strcmp(m->s_audio, e->audio_dev)) {
+        HC_LOG("audio: already capturing '%s'", e->audio_dev);
+        return;
+    }
+
+    snprintf(e->aud_pending_dev, sizeof e->aud_pending_dev, "%s", m->s_audio);
+    e->aud_pending = NULL;
+    atomic_store_explicit(&e->aud_pending_done, false, memory_order_relaxed);
+    if (pthread_create(&e->aud_open_tid, NULL, audio_open_thread, e) != 0) {
+        ev_error(e, "could not start the audio open thread; still capturing '%s'",
+                 e->audio_dev);
+        return;
+    }
+    e->aud_switching = true;
+    HC_LOG("audio: opening '%s' in the background", e->aud_pending_dev);
+}
+
+/* One tick's worth of "is the replacement leg ready yet?". */
+static void poll_audio_switch(struct engine *e)
+{
+    struct hc_audio *fresh, *old;
+
+    if (!e->aud_switching ||
+        !atomic_load_explicit(&e->aud_pending_done, memory_order_acquire))
+        return;
+
+    pthread_join(e->aud_open_tid, NULL);
+    e->aud_switching = false;
+    fresh = e->aud_pending;
+    e->aud_pending = NULL;
+
+    if (!fresh) {
+        ev_error(e, "hc_audio_open('%s') failed; still capturing '%s'",
+                 e->aud_pending_dev, e->audio_dev);
+        return;
+    }
+    if (!e->audio) {                      /* the session stopped while it opened */
+        hc_audio_close(fresh);
+        return;
+    }
+
+    /* Carry the live gain over: a fresh leg starts at unity. */
+    hc_audio_set_volume(fresh, e->gain);
+    hc_audio_set_muted(fresh, e->muted);
+    /* Empty the outgoing leg into the muxer first: those access units are
+     * already encoded, and dropping them would widen the hole at the switch by
+     * the whole depth of its ring. It also fixes where the new leg starts. */
+    drain_audio(e);
+
+    /* The replacement has been recording since it opened, so it holds audio
+     * that overlaps what was just sent, at timestamps already spent. Cut it at
+     * the last one delivered and the two legs join with no gap and no overlap. */
+    HC_LOG("switch: last delivered pts is %.1f ms old",
+           (double)(hc_now_ns() - e->last_audio_pts) / 1e6);
+    hc_audio_flush(fresh, e->last_audio_pts + 1);
+
+    /* drain_audio() runs on this thread, so the swap needs no lock. */
+    old = e->audio;
+    e->audio = fresh;
+    hc_audio_close(old);
+
+    snprintf(e->audio_dev, sizeof e->audio_dev, "%s", e->aud_pending_dev);
+    HC_LOG("audio: capturing '%s' (gain %.2f%s)", e->audio_dev,
+           (double)e->gain, e->muted ? ", muted" : "");
 }
 
 /* The capture thread asked for a pool rebuild, or died. */
@@ -1268,16 +1554,31 @@ static int handle_control(struct engine *e)
             if (e->running)
                 e->force_idr = true;
         } else if (!strcmp(m.cmd, "volume")) {
+            /*
+             * Each key stands alone. {"muted":true} used to arrive with gain
+             * defaulted to 0.0 and silence the stream permanently: unmuting
+             * afterwards restored a gain of nothing.
+             */
+            if (m.has_gain) {
+                float g = m.gain;
+                if (!(g >= 0.0f))            /* also catches NaN */
+                    g = 0.0f;
+                if (g > HC_GAIN_MAX)
+                    g = HC_GAIN_MAX;
+                e->gain = g;
+            }
+            if (m.has_muted)
+                e->muted = m.muted;
             if (!e->audio) {
                 ev_error(e, "volume with no audio leg");
             } else {
-                float g = m.gain;
-                if (g < 0.0f) g = 0.0f;
-                if (g > 1.0f) g = 1.0f;
-                hc_audio_set_volume(e->audio, g);
+                if (m.has_gain)
+                    hc_audio_set_volume(e->audio, e->gain);
                 if (m.has_muted)
-                    hc_audio_set_muted(e->audio, m.muted);
+                    hc_audio_set_muted(e->audio, e->muted);
             }
+        } else if (!strcmp(m.cmd, "audio")) {
+            cmd_audio(e, &m);
         } else if (!strcmp(m.cmd, "output")) {
             cmd_output(e, &m);
         } else if (!strcmp(m.cmd, "stop")) {
@@ -1299,6 +1600,8 @@ static void run(struct engine *e)
 
         if (handle_control(e) != 0)
             return;
+        poll_audio_switch(e);
+        capture_swap_if_ready(e);
 
         if (!e->running) {
             /* Nothing to pace: wait on the control fd instead of spinning. */
@@ -1383,7 +1686,10 @@ static void usage(const char *argv0)
         "  -> {\"cmd\":\"retune\",\"fps\":30}      re-time the pacer only\n"
         "  -> {\"cmd\":\"retune\",\"bitrate\":6000000}  rebuild the encoder only\n"
         "  -> {\"cmd\":\"idr\"}                  force a keyframe\n"
-        "  -> {\"cmd\":\"volume\",\"gain\":0.5,\"muted\":false}\n"
+        "  -> {\"cmd\":\"volume\",\"gain\":0.5,\"muted\":false}   1.0 is unity;\n"
+        "                                      an absent key is left alone\n"
+        "  -> {\"cmd\":\"audio\",\"audio\":\"...monitor\"}  reopen the audio "
+        "leg only\n"
         "  -> {\"cmd\":\"output\",\"name\":\"HEADLESS-1\"}   different wl_output\n"
         "  -> {\"cmd\":\"stop\"} / {\"cmd\":\"quit\"}\n"
         "  <- {\"ev\":\"ready\"} / {\"ev\":\"stats\",...} / {\"ev\":\"error\","
@@ -1438,6 +1744,7 @@ int main(int argc, char **argv)
     e.gbm_fd  = -1;
     e.hold_idx = -1;
     e.ctl_fd  = ctl_fd;
+    e.gain    = 1.0f;      /* unity, so a volume-less session is never quiet */
 
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_signal;

@@ -50,6 +50,20 @@ def main() -> int:
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--bitrate", default="4M")
     parser.add_argument("--no-audio", action="store_true", dest="no_audio")
+    parser.add_argument("--audio-mode", choices=("shared", "tv-only"),
+                        default="shared", dest="audio_mode",
+                        help="tv-only builds the null-sink route, exactly as a "
+                             "real cast does, and tears it down on exit")
+    parser.add_argument("--audio-device", default=None, dest="audio_device",
+                        help="Capture this pulse source instead of resolving one")
+    parser.add_argument("--volume", type=int, default=100,
+                        help="Cast volume applied at start; 100 is unity")
+    parser.add_argument("--muted", action="store_true",
+                        help="Start muted")
+    parser.add_argument("--ctl", action="store_true",
+                        help="Also serve the ctl socket, bridged to the live "
+                             "pipeline exactly as `hyprcast cast` does, so "
+                             "`hyprcast ctl volume 50` works against this harness")
     parser.add_argument("--peer-name", default="TV", dest="peer_name",
                         help="Peer name the source uses for its sink quirk checks")
     parser.add_argument("--source-port", type=int, default=19002, dest="source_port")
@@ -70,8 +84,11 @@ def main() -> int:
         fps=args.fps,
         bitrate=args.bitrate,
         output_resolution=None,
-        audio_device=None,
+        audio_device=args.audio_device,
         no_audio=args.no_audio,
+        audio_mode=args.audio_mode,
+        volume=args.volume,
+        muted=args.muted,
         source_port=args.source_port,
         latency_log_path=args.latency_log,
         peer_name=args.peer_name,
@@ -82,6 +99,24 @@ def main() -> int:
 
     rtsp = WFDRTSPServer(media_config=config, host=args.host, port=args.port)
     rtsp.start()
+
+    # The same Server, dispatcher and snapshot `hyprcast cast` uses -- nothing
+    # is reimplemented here, so what the harness proves about ctl also holds
+    # for the real flow.
+    ctl_server = None
+    if args.ctl:
+        from hyprcast import ctl as ctlmod
+        from hyprcast import wfd as wfdmod
+        from hyprcast.__main__ import _ctl_bridge, _wfd_snapshot
+
+        ns = argparse.Namespace(fps=args.fps, monitor_name=args.monitor_name,
+                                wfd_peer="", wfd_no_audio=args.no_audio)
+        ctl_server = ctlmod.Server(
+            lambda cmd, params: _ctl_bridge(wfdmod, ns, cmd, params),
+            lambda: _wfd_snapshot(wfdmod, ns),
+        )
+        ctl_server.serve_in_background()
+        print(f"[harness] control socket {ctl_server.path}", flush=True)
 
     stopping = False
 
@@ -100,6 +135,8 @@ def main() -> int:
     print("[harness] stopping", flush=True)
     rtsp.stop_all_media()
     rtsp.stop()
+    if ctl_server is not None:
+        ctl_server.server_close()
     return 0
 
 

@@ -262,9 +262,18 @@ struct hc_audio_cfg {
 struct hc_audio *hc_audio_open(const struct hc_audio_cfg *cfg);
 /* 1 = frame returned, 0 = nothing pending, negative = error. */
 int  hc_audio_read(struct hc_audio *a, const uint8_t **data, int *size, uint64_t *pts_ns);
-/* 0.0 .. 1.0 applied to the captured PCM before encoding; live-tunable. */
+/*
+ * Applied to the captured PCM before encoding; live-tunable. 1.0 is UNITY --
+ * the sink hears exactly what the monitor source carries. Above 1.0 is boost
+ * and the samples are hard-clipped at full scale, so it distorts before it
+ * gets loud; the clamp is 4.0. It never touches the laptop's own sink volume.
+ */
 void hc_audio_set_volume(struct hc_audio *a, float gain);
 void hc_audio_set_muted(struct hc_audio *a, bool muted);
+/* Drop queued access units older than floor_ns; 0 drops all of them and
+ * re-anchors the clock. Used when a leg opened in the background is swapped in:
+ * what it captured while warming up overlaps audio the muxer already sent. */
+int  hc_audio_flush(struct hc_audio *a, uint64_t floor_ns);
 void hc_audio_close(struct hc_audio *a);
 
 /* ---------------------------------------------------------------- control */
@@ -278,7 +287,15 @@ void hc_audio_close(struct hc_audio *a);
  *       "bitrate":8000000,"gop":60,"output":"eDP-1","audio":"...monitor"}
  *   -> {"cmd":"retune","fps":30}          fps/bitrate/qp, no restart
  *   -> {"cmd":"idr"}                      honour the sink's IDR request
- *   -> {"cmd":"volume","gain":0.5}        or {"muted":true}
+ *   -> {"cmd":"volume","gain":0.5}        or {"muted":true}; 1.0 is unity, and
+ *                                         either key alone leaves the other as
+ *                                         it was -- an absent "gain" is NOT 0
+ *   -> {"cmd":"audio","audio":"...monitor"}   reopen ONLY the audio leg against
+ *                                         another source; video, the encoder,
+ *                                         the mux and the RTP sequence space
+ *                                         are untouched and the sink is never
+ *                                         told, so it cannot be renegotiated
+ *                                         into a session that had no audio
  *   -> {"cmd":"output","name":"HEADLESS-1"}   rebuild capture, keep the session
  *   -> {"cmd":"stop"} / {"cmd":"quit"}
  *
@@ -293,7 +310,10 @@ struct hc_ctl_msg {
     char     s_dst_ip[64], s_output[64], s_audio[128];
     int      dst_port, src_port;
     uint32_t width, height, fps, bitrate, gop, qp;
+    /* has_gain matters: "gain" absent must mean "leave it alone", not 0.0,
+     * or {"cmd":"volume","muted":false} would unmute into silence. */
     float    gain;
+    bool     has_gain;
     bool     muted, has_muted;
     bool     low_power, has_low_power;
 };

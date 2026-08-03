@@ -3,6 +3,8 @@ hyprcast command line.
 
     hyprcast cast [--second-screen] [--monitor NAME] [--fps N] [--bitrate N]
     hyprcast ctl fps 30 | bitrate 6M | volume 50 | mute | monitor NAME | mode X
+    hyprcast ctl toggle-mode | toggle-mute | volume-up [N] | volume-down [N] | stop
+    hyprcast config [--path | --init]
     hyprcast status
     hyprcast waybar
     hyprcast doctor
@@ -20,12 +22,66 @@ import sys
 import threading
 
 from . import audio as audiomod
+from . import config as configmod
 from . import ctl as ctlmod
 from . import hypr
 from . import waybar as waybarmod
-from .session import DEFAULT_WIRE, MODES, Session, SessionError, engine_path, parse_bitrate
+from .session import (DEFAULT_VOLUME_STEP, MODES, Session, SessionError,
+                      engine_path, mode_label, normalize_mode, parse_bitrate)
 
 PROG = "hyprcast"
+
+# What the config file calls the two modes. session.MODES spells the second one
+# "second-screen"; the file and the flag say "extend".
+MODE_NAMES = ("mirror", "extend")
+
+# argparse dest -> the config key it overrides. Every one of these arguments is
+# declared with default=None (store_true included) so that "absent" is
+# distinguishable from "happens to equal the default"; config.apply_flags then
+# ignores the Nones and the file value survives.
+_FLAG_MAP = {
+    "fps":         ("cast", "fps"),
+    "bitrate":     ("cast", "bitrate"),
+    "mode":        ("cast", "mode"),
+    "monitor":     ("cast", "monitor"),
+    "audio":       ("cast", "audio"),
+    "volume":      ("cast", "volume"),
+    "low_power":   ("cast", "low_power"),
+    "qp":          ("cast", "qp"),
+    "no_firewall": ("cast", "no_firewall"),
+    "width":       ("cast", "width"),
+    "height":      ("cast", "height"),
+    "interface":   ("wifi", "interface"),
+    "timeout":     ("wifi", "timeout"),
+    "sink":        ("wifi", "sink"),
+    "go_intent":   ("wifi", "go_intent"),
+}
+
+
+def _load_config(args) -> configmod.Config:
+    """File + flags, in that order of increasing authority."""
+    cfg = configmod.load()
+    for warning in cfg.warnings:
+        print(f"{PROG}: warning: {warning}", file=sys.stderr)
+    # --second-screen is the older spelling of mode = "extend".
+    if getattr(args, "second_screen", None) and getattr(args, "mode", None) is None:
+        args.mode = "extend"
+    configmod.apply_flags(
+        cfg, {target: getattr(args, dest, None) for dest, target in _FLAG_MAP.items()})
+    return cfg
+
+
+def _merge_config(args) -> configmod.Config:
+    """Write the merged values back onto `args`, so nothing downstream changes."""
+    cfg = _load_config(args)
+    for dest, (section, key) in _FLAG_MAP.items():
+        setattr(args, dest, cfg.get(section, key))
+    # "" and None are NOT the same peer selector: _scan_and_select() treats None
+    # as "discover and pick" and anything else as a selector to match, so an
+    # empty sink= would retry three scans and fail.
+    args.sink = args.sink or None
+    args.second_screen = (args.mode == "extend")
+    return cfg
 
 
 # ------------------------------------------------------------------- cast
@@ -42,6 +98,11 @@ def cmd_cast(args) -> int:
                     useful against tools/mock-sink.py, because a real sink will
                     not render anything it did not negotiate.
     """
+    try:
+        _merge_config(args)
+    except configmod.ConfigError as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
     if not args.peer:
         return _cast_wfd(args)
     return _cast_direct(args)
@@ -62,7 +123,9 @@ def _cast_wfd(args) -> int:
         wfd_rtsp_port=args.rtsp_port,
         wfd_rtp_source_port=args.src_port,
         wfd_no_audio=(args.audio == "none"),
-        wfd_audio_device=None,
+        wfd_audio_mode=args.audio,
+        wfd_audio_device=args.audio_device or None,
+        wfd_volume=args.volume,
         wfd_low_power=args.low_power,
         wfd_qp=args.qp,
         wfd_no_firewall=args.no_firewall,
@@ -77,7 +140,7 @@ def _cast_wfd(args) -> int:
     server = None
     try:
         server = ctlmod.Server(
-            lambda cmd, params: _ctl_bridge(wfd, cmd, params),
+            lambda cmd, params: _ctl_bridge(wfd, ns, cmd, params),
             lambda: _wfd_snapshot(wfd, ns),
         )
         server.serve_in_background()
@@ -99,8 +162,57 @@ def _cast_wfd(args) -> int:
             server.server_close()
 
 
-def _ctl_bridge(wfd, cmd: str, params: dict):
-    """Route a ctl command at the live WFD pipeline."""
+def _volume_step(params: dict) -> int:
+    """The step of a volume-up/down. Bar scroll bindings send no argument."""
+    raw = params.get("value")
+    if raw in (None, ""):
+        return DEFAULT_VOLUME_STEP
+    try:
+        return max(1, min(100, abs(int(raw))))
+    except (TypeError, ValueError):
+        raise ctlmod.CtlError(f"volume step must be an integer, not {raw!r}") from None
+
+
+def _ctl_bridge(wfd, ns, cmd: str, params: dict):
+    """Route a ctl command at the live WFD pipeline.
+
+    Every relative command -- toggle-mode, toggle-mute, volume-up, volume-down
+    -- is resolved on this side. waybar runs a click binding as a bare shell
+    command with no way to read the current state first, so "the other mode"
+    and "five points louder" have to mean something to the socket, not to the
+    caller.
+    """
+    # Answerable at any point in the session, including before the media leg
+    # exists. `status` in particular: it is what the bar and every script ask
+    # first, and "no session is running" is not an answer to "what are you
+    # doing" while a P2P scan is in progress.
+    if cmd == "status":
+        return {"ok": True, "state": _wfd_snapshot(wfd, ns)}
+
+    if cmd in ("stop", "quit"):
+        # The whole session, not just the engine: leaving the P2P group up and
+        # the GO intent lowered makes the next cast fight a stale NetworkManager
+        # activation. The main loop unwinds through its full teardown within 1 s.
+        wfd.request_stop()
+        return {"ok": True, "state": _wfd_snapshot(wfd, ns)}
+
+    if cmd == "list-outputs":
+        try:
+            outputs = [m.as_dict() for m in hypr.list_monitors()]
+        except hypr.HyprError as exc:
+            raise ctlmod.CtlError(str(exc)) from None
+        return {"ok": True, "outputs": outputs, "state": _wfd_snapshot(wfd, ns)}
+
+    if cmd == "list-sinks":
+        # Answerable while the P2P scan is still running: choosing the sink to
+        # capture does not need a media session, and being told "no session is
+        # running" when you only asked what exists is useless.
+        try:
+            sinks = [s.as_dict() for s in audiomod.list_sinks()]
+        except audiomod.AudioError as exc:
+            raise ctlmod.CtlError(str(exc)) from None
+        return {"ok": True, "sinks": sinks, "state": _wfd_snapshot(wfd, ns)}
+
     p = wfd.current_pipeline()
     if p is None:
         raise ctlmod.CtlError("no session is running")
@@ -111,34 +223,67 @@ def _ctl_bridge(wfd, cmd: str, params: dict):
     elif cmd == "qp":
         p.retune(qp=int(params["value"]))
     elif cmd == "volume":
-        p.volume(gain=float(params["value"]) / 100.0)
+        p.set_volume(params["value"])
+    elif cmd == "volume-up":
+        p.nudge_volume(_volume_step(params))
+    elif cmd == "volume-down":
+        p.nudge_volume(-_volume_step(params))
     elif cmd == "mute":
-        p.volume(muted=bool(params.get("value", True)))
+        p.set_muted(params.get("value", "toggle"))
+    elif cmd == "toggle-mute":
+        p.set_muted("toggle")
+    elif cmd == "mode":
+        p.set_mode(str(params["value"]))
+    elif cmd == "toggle-mode":
+        p.toggle_mode()
+    elif cmd == "sink":
+        # WFDNotReady is this module's "you cannot do that right now"; without
+        # the translation the socket reports it as "WFDNotReady: ..." and the
+        # class name ends up in front of the user.
+        try:
+            p.set_audio_source(str(params["value"]))
+        except wfd.WFDNotReady as exc:
+            raise ctlmod.CtlError(str(exc)) from None
     elif cmd == "idr":
         p.request_idr()
     elif cmd == "monitor":
         p.set_output(str(params["value"]))
-    elif cmd == "stop":
-        p.stop()
     else:
         raise ctlmod.CtlError(f"unsupported while casting over WFD: {cmd}")
-    return {"ok": True}
+    return {"ok": True, "state": _wfd_snapshot(wfd, ns)}
 
 
 def _wfd_snapshot(wfd, ns) -> dict:
+    """Session state in exactly the shape session.Session.snapshot() returns.
+
+    One shape, so `status`, `ctl` and the waybar module never have to know
+    which of the two cast routes is live. Before the pipeline exists there is
+    still something worth reporting -- scanning is not the same as
+    handshaking -- and that comes from wfd's phase.
+    """
     p = wfd.current_pipeline()
-    if p is None:
-        return {"state": "discovering", "peer": ns.wfd_peer or "", "fps": ns.fps}
+    if p is not None:
+        return p.snapshot()
+    phase = wfd.session_phase()
     return {
-        "state": "casting" if p.is_alive() else "error",
-        "peer": p.tv_ip,
-        "width": p.width,
-        "height": p.height,
-        "fps": p.config.fps,
-        "bitrate_kbits": p.bitrate_kbits,
+        "state": phase.get("state") or "idle",
+        "error": "",
         "mode": "mirror",
-        "capture_output": (p.config.monitor.name if p.config.monitor else ""),
-        "health": p.health_summary(),
+        "monitor": getattr(ns, "monitor_name", "") or "",
+        "capture_output": "",
+        "peer": phase.get("peer") or (getattr(ns, "wfd_peer", "") or ""),
+        "peer_name": phase.get("peer_name") or "",
+        "detail": phase.get("detail") or "",
+        "width": 0,
+        "height": 0,
+        "fps": getattr(ns, "fps", 0) or 0,
+        "bitrate": 0,
+        "volume": 100,
+        "muted": False,
+        "audio_mode": "none" if getattr(ns, "wfd_no_audio", False) else "shared",
+        "audio_source": "",
+        "duration": 0.0,
+        "stats": {"fps": 0.0, "kbps": 0.0, "cpu": 0.0, "drops": 0, "idr": 0},
     }
 
 
@@ -180,6 +325,7 @@ def _cast_direct(args) -> int:
             width=args.width, height=args.height,
             audio_mode=args.audio, peer=peer, dst_port=dst_port,
             src_port=args.src_port, low_power=args.low_power,
+            volume=args.volume,
         )
     except SessionError as exc:
         server.server_close()
@@ -280,8 +426,13 @@ def cmd_probe(args) -> int:
 
 
 # -------------------------------------------------------------------- ctl
-_CTL_VALUE_CMDS = {"fps", "bitrate", "volume", "monitor", "mode"}
-_CTL_NOARG_CMDS = {"status", "start", "stop", "list-outputs", "list-sinks", "quit"}
+_CTL_VALUE_CMDS = {"fps", "bitrate", "volume", "monitor", "mode", "qp", "sink"}
+# Optional argument: the step, defaulting to DEFAULT_VOLUME_STEP. A waybar
+# on-scroll binding passes nothing at all.
+_CTL_STEP_CMDS = {"volume-up", "volume-down"}
+_CTL_NOARG_CMDS = {"status", "start", "stop", "idr", "toggle-mode", "toggle-mute",
+                   "list-outputs", "list-sinks", "quit"}
+_CTL_COMMANDS = sorted(_CTL_VALUE_CMDS | _CTL_STEP_CMDS | _CTL_NOARG_CMDS | {"mute"})
 
 
 def cmd_ctl(args) -> int:
@@ -296,16 +447,24 @@ def cmd_ctl(args) -> int:
         except SessionError as exc:
             print(f"{PROG}: {exc}", file=sys.stderr)
             return 2
-    elif command in ("fps", "volume"):
+    elif command in ("fps", "volume", "qp"):
         if not str(args.value).lstrip("-").isdigit():
             print(f"{PROG} ctl {command}: needs an integer", file=sys.stderr)
             return 2
         fields["value"] = int(args.value)
+    elif command in _CTL_STEP_CMDS:
+        if args.value is not None:
+            if not str(args.value).lstrip("-").isdigit():
+                print(f"{PROG} ctl {command}: the step must be an integer",
+                      file=sys.stderr)
+                return 2
+            fields["value"] = abs(int(args.value))
     elif command == "mode":
-        if args.value not in MODES:
-            print(f"{PROG} ctl mode: use {' or '.join(MODES)}", file=sys.stderr)
+        try:
+            fields["value"] = normalize_mode(args.value)
+        except SessionError as exc:
+            print(f"{PROG} ctl mode: {exc}", file=sys.stderr)
             return 2
-        fields["value"] = args.value
     elif command == "mute":
         fields["value"] = args.value or "toggle"
     elif command in _CTL_VALUE_CMDS:
@@ -359,22 +518,55 @@ def cmd_status(args) -> int:
 
 
 def _print_status(state: dict) -> None:
+    """What a person wants to read. `--json` is there for everything else."""
     if not state:
-        print("hyprcast: no state")
+        print(f"{PROG}: no state")
         return
-    stats = state.get("stats", {})
-    print(f"state      {state.get('state')}"
-          + (f"  ({state['error']})" if state.get("error") else ""))
-    print(f"mode       {state.get('mode')}  capture={state.get('capture_output') or '-'}")
-    print(f"wire       {state.get('width')}x{state.get('height')}@{state.get('fps')} "
-          f"target {state.get('bitrate', 0) / 1e6:.1f} Mb/s")
-    print(f"peer       {state.get('peer') or '-'}")
-    print(f"audio      {state.get('audio_mode')}  {state.get('audio_source') or '-'}  "
-          f"vol={state.get('volume')}%{' muted' if state.get('muted') else ''}")
-    if state.get("state") == "casting":
-        print(f"measured   {stats.get('fps', 0):.1f} fps  {stats.get('kbps', 0)} kb/s  "
-              f"drops={stats.get('drops', 0)}  idr={stats.get('idr', 0)}")
-        print(f"duration   {state.get('duration', 0):.0f}s")
+
+    name = str(state.get("state") or "idle")
+    peer = waybarmod.peer_label(state)
+    if name == "casting":
+        headline = f"casting to {peer} for {waybarmod.duration(state.get('duration', 0))}"
+    elif name == "connecting":
+        headline = f"connecting to {peer}"
+    elif name == "discovering":
+        headline = state.get("detail") or "looking for a sink"
+    elif name == "error":
+        headline = f"error -- {state.get('error') or 'no detail'}"
+    else:
+        headline = "idle"
+    print(f"{PROG}: {headline}")
+
+    if name != "casting":
+        detail = {"idle": f"start one with `{PROG} cast`",
+                  "connecting": str(state.get("detail") or "")}.get(name, "")
+        if detail:
+            print(f"  {detail}")
+        return
+
+    stats = state.get("stats") or {}
+    drops = int(stats.get("drops", 0) or 0)
+    width, height = state.get("width") or 0, state.get("height") or 0
+    audio = str(state.get("audio_mode") or "shared")
+    rows = [
+        ("wire", f"{width}x{height} @ {state.get('fps')} fps, "
+                 f"{state.get('bitrate', 0) / 1e6:.1f} Mb/s target"),
+        ("measured", f"{float(stats.get('fps', 0.0)):.1f} fps, "
+                     f"{waybarmod.rate(float(stats.get('kbps', 0.0)) * 1000)}"
+                     + (f", cpu {float(stats.get('cpu', 0.0)) * 100:.0f}%"
+                        if stats.get("cpu") else "")
+                     + (f", DROPS {drops}" if drops else "")
+                     + (f", idr {stats.get('idr')}" if stats.get("idr") else "")),
+        ("capture", f"{state.get('capture_output') or '?'} "
+                    f"({mode_label(state.get('mode'))})"),
+        ("audio", "off (video only)" if audio == "none" else
+                  f"{audio}, " + ("MUTED" if state.get("muted")
+                                  else f"volume {state.get('volume', 100)}%")),
+    ]
+    if state.get("error"):
+        rows.append(("last error", str(state["error"])))
+    for label, value in rows:
+        print(f"  {label:<10} {value}")
 
 
 # ----------------------------------------------------------------- doctor
@@ -502,51 +694,114 @@ def cmd_waybar(args) -> int:
     return waybarmod.run()
 
 
+# ----------------------------------------------------------------- config
+def cmd_config(args) -> int:
+    path = configmod.config_path()
+    if args.path:
+        print(path)
+        return 0
+    if args.init:
+        try:
+            configmod.write_starter(path)
+        except configmod.ConfigError as exc:
+            print(f"{PROG}: {exc}", file=sys.stderr)
+            return 1
+        print(f"{PROG}: wrote {path}")
+        return 0
+    try:
+        cfg = _load_config(args)
+    except configmod.ConfigError as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(
+            {"path": cfg.path, "exists": cfg.exists,
+             "config": {section: {key: {"value": value, "source": source}
+                                  for s, key, value, source in cfg.rows() if s == section}
+                        for section in configmod.SPEC}},
+            indent=2))
+    else:
+        print("\n".join(configmod.describe(cfg)))
+    return 0
+
+
 # ------------------------------------------------------------------- main
+def _config_flags() -> argparse.ArgumentParser:
+    """The arguments that a config key can supply.
+
+    Shared by `cast` and `config` so that `hyprcast config --fps 30` shows
+    exactly the precedence `hyprcast cast --fps 30` would get. Every default is
+    None: see _FLAG_MAP.
+    """
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--mode", choices=MODE_NAMES, default=None,
+                   help="mirror an existing output, or extend onto a headless one")
+    p.add_argument("--second-screen", action="store_true", default=None,
+                   help="alias for --mode extend")
+    p.add_argument("--monitor", metavar="NAME", default=None,
+                   help="output to mirror (name or description substring)")
+    p.add_argument("--fps", type=int, default=None)
+    p.add_argument("--bitrate", default=None, help="e.g. 8M, 6000k")
+    p.add_argument("--width", type=int, default=None)
+    p.add_argument("--height", type=int, default=None)
+    p.add_argument("--audio", choices=("shared", "tv-only", "none"), default=None,
+                   help="tv-only routes playback through a null sink so the "
+                        "laptop speakers stay silent")
+    p.add_argument("--volume", type=int, default=None, metavar="0-100",
+                   help="cast volume applied at start; 100 is unity and the "
+                        "laptop's own volume is never touched")
+    p.add_argument("--low-power", action="store_true", default=None,
+                   help="VDEnc/EncSliceLP -- CQP only on Gen9.5, ignores --bitrate")
+    p.add_argument("--qp", type=int, default=None,
+                   help="CQP quantiser, only with --low-power")
+    p.add_argument("--no-firewall", action="store_true", default=None,
+                   help="do not touch firewalld (it can time out on this box)")
+    p.add_argument("--sink", metavar="MAC", default=None,
+                   help="skip discovery and connect to this P2P peer MAC")
+    p.add_argument("--interface", default=None,
+                   help="wpa_supplicant P2P control interface")
+    p.add_argument("--timeout", type=int, default=None,
+                   help="seconds to wait for the sink to appear")
+    p.add_argument("--go-intent", type=int, default=None, metavar="0-15",
+                   help="P2P group-owner intent; 15 makes us the GO")
+    return p
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG, description="Cast a Hyprland output to a Miracast sink.")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    flags = _config_flags()
 
-    cast = sub.add_parser("cast", help="run a session in the foreground")
-    cast.add_argument("--second-screen", action="store_true",
-                      help="create a headless output at the wire mode instead of mirroring")
-    cast.add_argument("--monitor", metavar="NAME",
-                      help="output to mirror (name or description substring)")
-    cast.add_argument("--fps", type=int, default=60)
-    cast.add_argument("--bitrate", default="8M", help="e.g. 8M, 6000k")
-    cast.add_argument("--width", type=int, default=DEFAULT_WIRE[0])
-    cast.add_argument("--height", type=int, default=DEFAULT_WIRE[1])
-    cast.add_argument("--audio", choices=("shared", "tv-only", "none"), default="shared",
-                      help="tv-only routes playback through a null sink so the "
-                           "laptop speakers stay silent")
+    cast = sub.add_parser("cast", parents=[flags],
+                          help="run a session in the foreground")
     cast.add_argument("--peer", metavar="IP[:PORT]",
                       help="stream straight at this address, skipping P2P+RTSP (mock-sink only)")
     cast.add_argument("--src-port", type=int, default=19002)
-    cast.add_argument("--low-power", action="store_true",
-                      help="VDEnc/EncSliceLP -- CQP only on Gen9.5, ignores --bitrate")
-    cast.add_argument("--sink", metavar="MAC",
-                      help="skip discovery and connect to this P2P peer MAC")
-    cast.add_argument("--interface", default="p2p-dev-wlan0",
-                      help="wpa_supplicant P2P control interface")
-    cast.add_argument("--timeout", type=int, default=60,
-                      help="seconds to wait for the sink to appear")
     cast.add_argument("--rtsp-port", type=int, default=7236)
-    cast.add_argument("--go-intent", type=int, default=None, metavar="0-15",
-                      help="P2P group-owner intent; 15 makes us the GO")
-    cast.add_argument("--qp", type=int, default=None,
-                      help="CQP quantiser, only with --low-power")
-    cast.add_argument("--no-firewall", action="store_true",
-                      help="do not touch firewalld (it can time out on this box)")
+    cast.add_argument("--audio-device", metavar="SOURCE", default=None,
+                      help="capture this PipeWire source instead of the default "
+                           "sink's monitor; skips --audio routing entirely")
     cast.add_argument("--latency-log", nargs="?", const=True, default=None,
                       metavar="PATH", help="write a session JSONL")
     cast.add_argument("--idle", action="store_true",
                       help="serve the control socket without starting the media path")
     cast.set_defaults(func=cmd_cast)
 
+    conf = sub.add_parser("config", parents=[flags],
+                          help="show or create the config file")
+    conf.add_argument("--path", action="store_true",
+                      help="print where the config file is looked for")
+    conf.add_argument("--init", action="store_true",
+                      help="write a commented starter file, never overwriting one")
+    conf.add_argument("--json", action="store_true")
+    conf.set_defaults(func=cmd_config)
+
     ctl = sub.add_parser("ctl", help="drive a running session")
-    ctl.add_argument("command", choices=sorted(_CTL_VALUE_CMDS | _CTL_NOARG_CMDS | {"mute"}))
-    ctl.add_argument("value", nargs="?")
+    ctl.add_argument("command", choices=_CTL_COMMANDS, metavar="COMMAND",
+                     help=" | ".join(_CTL_COMMANDS))
+    ctl.add_argument("value", nargs="?",
+                     help="the new value; the step for volume-up/volume-down")
     ctl.add_argument("--json", action="store_true")
     ctl.set_defaults(func=cmd_ctl)
 

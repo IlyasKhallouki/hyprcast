@@ -12,8 +12,14 @@ connection stays open, receiving {"ev":"state","state":{...}} on every change
 plus a heartbeat. That is what makes `hyprcast waybar` a streaming module
 instead of a polling one.
 
-Commands: status start stop fps bitrate volume mute monitor mode
+Commands: status start stop fps bitrate qp idr volume mute monitor mode sink
+          toggle-mode toggle-mute volume-up volume-down
           list-outputs list-sinks subscribe quit
+
+The four hyphenated ones exist for bar buttons. waybar sends on-click and
+on-scroll as plain shell commands with no way to read state first, so anything
+relative -- toggle, step up, step down -- has to resolve against the current
+value on this side of the socket.
 """
 
 from __future__ import annotations
@@ -29,8 +35,9 @@ import threading
 __all__ = ["socket_path", "Server", "Client", "CtlError", "NotRunning", "COMMANDS"]
 
 COMMANDS = (
-    "status", "start", "stop", "fps", "bitrate", "volume", "mute",
-    "monitor", "mode", "list-outputs", "list-sinks", "subscribe", "quit",
+    "status", "start", "stop", "fps", "bitrate", "qp", "idr", "volume", "mute",
+    "monitor", "mode", "sink", "toggle-mode", "toggle-mute", "volume-up",
+    "volume-down", "list-outputs", "list-sinks", "subscribe", "quit",
 )
 
 HEARTBEAT_S = 1.0
@@ -99,7 +106,14 @@ class _Handler(socketserver.StreamRequestHandler):
             raise BrokenPipeError from None
 
     def _pump(self) -> None:
-        """Block until the subscriber goes away; pushes arrive via push()."""
+        """Block until the subscriber goes away; pushes arrive via push().
+
+        The heartbeat carries the current state, not just a pulse. Only the
+        direct-cast path wires broadcast() into its session; the WFD path has
+        no change hook to hang it on, and a subscriber that only ever saw the
+        snapshot it connected with would show a frozen bar for the whole cast.
+        Once a second is also what makes the tooltip's session timer count.
+        """
         server: "Server" = self.server  # type: ignore[assignment]
         self.connection.settimeout(HEARTBEAT_S)
         while not server.stopping:
@@ -107,8 +121,13 @@ class _Handler(socketserver.StreamRequestHandler):
                 if not self.connection.recv(256):
                     return          # peer closed
             except socket.timeout:
+                beat: dict = {"ev": "tick"}
                 try:
-                    _send_line(self.connection, {"ev": "tick"})
+                    beat["state"] = server.snapshot()
+                except Exception:
+                    pass            # a broken snapshot must not drop the client
+                try:
+                    _send_line(self.connection, beat)
                 except OSError:
                     return
             except OSError:

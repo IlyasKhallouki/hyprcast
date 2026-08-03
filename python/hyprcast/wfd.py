@@ -16,7 +16,10 @@ from dataclasses import dataclass, replace
 from typing import NamedTuple, Optional
 
 # The media leg is hyprcast-engine, driven over a socketpair by engine.py.
+from . import audio as audiomod
+from . import hypr
 from .engine import Engine, EngineError
+from .session import HEADLESS_NAME, normalize_mode
 
 WFD_RTSP_PORT = 7236
 
@@ -36,6 +39,53 @@ def _publish(pipeline) -> None:
     global _ACTIVE
     with _ACTIVE_LOCK:
         _ACTIVE = pipeline
+
+
+# Where the session is between "process started" and "pixels on the TV".
+# Without this the ctl snapshot cannot tell scanning from handshaking -- both
+# are just "no pipeline yet" -- and the waybar module has no `connecting` to
+# show for the ten-odd seconds P2P association takes.
+_PHASE: dict[str, str] = {"state": "idle", "peer": "", "peer_name": "", "detail": ""}
+_PHASE_LOCK = threading.Lock()
+_STOP_REQUESTED = threading.Event()
+
+
+def session_phase() -> dict[str, str]:
+    """The coarse state of the WFD flow: idle/discovering/connecting/casting."""
+    with _PHASE_LOCK:
+        return dict(_PHASE)
+
+
+def _set_phase(state: str, **info: str) -> None:
+    with _PHASE_LOCK:
+        _PHASE["state"] = state
+        _PHASE.update(info)
+
+
+def request_stop() -> bool:
+    """Tear the whole session down, not just the media leg.
+
+    A bar button labelled "stop" must end the cast. Killing only the engine
+    would leave the P2P group up and the GO intent lowered, and the next
+    `hyprcast cast` then has to fight a stale NetworkManager activation. The
+    main loop in start_experimental_backend polls this, so the entire finally
+    block -- media, RTSP, firewall, connection, GO intent -- still runs.
+    """
+    _STOP_REQUESTED.set()
+    pipeline = current_pipeline()
+    if pipeline is not None:
+        # In a thread, because the caller is a ctl request handler that has not
+        # sent its reply yet: engine.quit() can take seconds, and the main loop
+        # would meanwhile close the socket out from under the client, which
+        # then reports a failure for a stop that in fact worked. The teardown
+        # calls stop() again; it is idempotent.
+        threading.Thread(target=pipeline.stop, name="hyprcast-ctl-stop",
+                         daemon=True).start()
+    return True
+
+
+def stop_requested() -> bool:
+    return _STOP_REQUESTED.is_set()
 
 try:
     _DEVICE_NAME: str = re.sub(r"[^a-zA-Z0-9\-]", "", socket.gethostname().split(".")[0])[:32] or "FluxCast"
@@ -180,6 +230,12 @@ class WFDMediaConfig:
     output_resolution: Optional[str] = None
     audio_device: Optional[str] = None
     no_audio: bool = False
+    # shared  -- capture the default sink's monitor; the laptop keeps playing.
+    # tv-only -- a null sink owns playback, so only the TV hears it.
+    # none    -- no audio leg at all (no_audio carries that to the engine).
+    audio_mode: str = "shared"
+    volume: int = 100          # percent; 100 is unity gain, not "loud"
+    muted: bool = False
     source_port: int = 19002
     latency_log_path: Optional[str] = None
     peer_name: str = ""
@@ -761,7 +817,21 @@ class NativeSender:
         self.width = 0
         self.height = 0
         self.bitrate_kbits = 0
+        self.started_at = 0.0
+        # Runtime state the ctl socket reports and the relative knobs
+        # (volume-up, toggle-mute, toggle-mode) read before they act. The
+        # engine has no getters -- it is told, never asked -- so whatever is
+        # sent has to be remembered here.
+        self.mode = "mirror"
+        self.volume_pct = max(0, min(100, int(config.volume)))
+        self.muted = bool(config.muted)
+        self.capture_output = ""
+        self.audio_source = ""
+        self._route: Optional[audiomod.NullSinkRoute] = None
+        self._headless: Optional[hypr.HeadlessOutput] = None
+        self._retired: list[hypr.HeadlessOutput] = []
         self._lock = threading.Lock()
+        self._mode_lock = threading.Lock()
         self._last_idr = 0.0
 
     # ------------------------------------------------------------------ start
@@ -776,6 +846,53 @@ class NativeSender:
         if monitor is not None:
             return monitor.width, monitor.height
         return 1280, 720
+
+    def _open_audio_route(self) -> str:
+        """Resolve the source the engine captures, building the route it needs.
+
+        shared   the default sink's monitor. Nothing is reconfigured, so there
+                 is nothing to restore and a crash costs the user nothing.
+        tv-only  a `hyprcast` null sink takes over playback and the engine
+                 captures its monitor, so the laptop speakers go quiet. Every
+                 mutation is recorded in audio.py's state file first.
+
+        An explicit --audio-device always wins: the caller named a source, so
+        no routing is invented on top of it.
+        """
+        if self.config.audio_device:
+            self.audio_source = self.config.audio_device
+            return self.audio_source
+
+        if self.config.audio_mode == "tv-only":
+            try:
+                route = _acquire_audio_route()
+            except audiomod.AudioError as exc:
+                # Falling back to shared is the safe failure: the user hears
+                # their laptop, which is exactly today's behaviour, instead of
+                # losing the cast's audio to a half-built route.
+                print(f"[hyprcast Media] tv-only routing failed ({exc}); "
+                      f"falling back to shared audio")
+                self.audio_source = _detect_audio_monitor() or ""
+                return self.audio_source
+            self._route = route
+            self.audio_source = route.monitor_source
+            return self.audio_source
+
+        self.audio_source = _detect_audio_monitor() or ""
+        return self.audio_source
+
+    def _close_audio_route(self) -> None:
+        """Drop this session's claim on the route. Idempotent, never raises.
+
+        ORDER: this session's engine must already be gone. Unloading the null
+        sink while the engine's pulse stream is still reading its monitor would
+        pull the audio source out from under it -- the same create-before-
+        destroy discipline the headless outputs follow.
+        """
+        route, self._route = self._route, None
+        if route is None:
+            return
+        _release_audio_route()
 
     def start(self) -> None:
         if self.engine is not None:
@@ -810,7 +927,7 @@ class NativeSender:
             params["output"] = monitor.name
 
         if not self.config.no_audio:
-            audio = self.config.audio_device or _detect_audio_monitor()
+            audio = self._open_audio_route()
             if audio:
                 params["audio"] = audio
             else:
@@ -842,9 +959,28 @@ class NativeSender:
             engine.start(**params)
         except EngineError as exc:
             engine.quit()
+            # The engine is reaped, so the null sink has no reader left.
+            self._close_audio_route()
             raise WFDNotReady(f"hyprcast-engine failed to start: {exc}") from exc
         self.engine = engine
+        self.started_at = time.time()
+        # "" would be reported as an unknown output; with no monitor named, the
+        # engine binds the first one it is offered, and that is worth saying.
+        self.capture_output = monitor.name if monitor is not None else "auto"
+
+        # The engine always starts at unity and unmuted, so the configured
+        # default is applied here and nowhere else. Skipping the call when it
+        # would be a no-op keeps a video-only session from drawing a "volume
+        # with no audio leg" error out of the engine.
+        if params.get("audio") and (self.volume_pct != 100 or self.muted):
+            try:
+                engine.volume(gain=self.volume_pct / 100.0, muted=self.muted)
+                print(f"[hyprcast Media] Audio          : volume "
+                      f"{self.volume_pct}%{' (muted)' if self.muted else ''}")
+            except EngineError as exc:
+                print(f"[hyprcast Media] could not apply the default volume: {exc}")
         _publish(self)
+        _set_phase("casting", peer_name=self.config.peer_name or "", peer=self.tv_ip)
         _append_latency_log(
             self.config.latency_log_path,
             "engine_ready",
@@ -863,12 +999,33 @@ class NativeSender:
 
     def stop(self) -> None:
         _publish(None)
+        _set_phase("idle")
         with self._lock:
             engine, self.engine = self.engine, None
         if engine is None:
+            self._drop_outputs()
+            self._close_audio_route()
             return
         code = engine.quit()
         _append_latency_log(self.config.latency_log_path, "engine_stopped", code=code)
+        # Only now. The engine is reaped, so nothing holds a capture session on
+        # these outputs and destroying them cannot reach
+        # CScreenshareFrame::transform() with a dead monitor. The audio route
+        # comes down under the same rule: no reader left on its monitor.
+        self._drop_outputs()
+        self._close_audio_route()
+
+    def _drop_outputs(self) -> None:
+        """Destroy every headless output this session created. Idempotent."""
+        with self._mode_lock:
+            pending = [o for o in ([self._headless] + self._retired) if o is not None]
+            self._headless = None
+            self._retired = []
+        for output in pending:
+            try:
+                output.close()
+            except hypr.HyprError as exc:
+                print(f"[hyprcast Media] could not remove {output.name}: {exc}")
 
     # ------------------------------------------------------------ runtime knobs
 
@@ -907,6 +1064,87 @@ class NativeSender:
         if engine is None:
             raise WFDNotReady("no media session")
         engine.volume(gain=gain, muted=muted)
+        if gain is not None:
+            self.volume_pct = max(0, min(100, int(round(float(gain) * 100))))
+        if muted is not None:
+            self.muted = bool(muted)
+
+    def set_volume(self, percent) -> int:
+        """Absolute volume, 0..100. Returns what it ended up as."""
+        try:
+            wanted = int(round(float(percent)))
+        except (TypeError, ValueError):
+            raise WFDNotReady(f"volume takes a number, not {percent!r}") from None
+        wanted = max(0, min(100, wanted))
+        self.volume(gain=wanted / 100.0)
+        return wanted
+
+    def nudge_volume(self, step: int) -> int:
+        """Relative volume for scroll bindings. Clamped, never wraps."""
+        return self.set_volume(self.volume_pct + int(step))
+
+    def set_muted(self, value=True) -> bool:
+        """True/False, or the string 'toggle'."""
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in ("toggle", ""):
+                wanted = not self.muted
+            elif lowered in ("on", "true", "yes", "1", "mute", "muted"):
+                wanted = True
+            elif lowered in ("off", "false", "no", "0", "unmute"):
+                wanted = False
+            else:
+                raise WFDNotReady("mute takes on, off or toggle")
+        else:
+            wanted = bool(value)
+        self.volume(muted=wanted)
+        return wanted
+
+    def set_audio_source(self, name: str) -> str:
+        """Capture a different sink mid-session. Only the audio leg restarts.
+
+        `name` is a SINK name (what `ctl list-sinks` prints); the engine is
+        given that sink's monitor source, because the sink itself is an output
+        and capturing it would record nothing. A monitor source passed straight
+        through still works, for symmetry with --audio-device.
+
+        Refused under tv-only: there the null sink IS the capture source, and
+        pointing the engine somewhere else would leave playback trapped on a
+        sink nobody is listening to -- silence at both ends.
+        """
+        engine = self.engine
+        if engine is None:
+            raise WFDNotReady("no media session")
+        if self.config.no_audio:
+            raise WFDNotReady(
+                "this session has no audio leg; it was started with --audio none")
+        if self._route is not None:
+            raise WFDNotReady(
+                "tv-only routing owns the capture source; restart with "
+                "--audio shared to choose a sink")
+
+        wanted = (name or "").strip()
+        if not wanted:
+            raise WFDNotReady("sink needs a name -- see `hyprcast ctl list-sinks`")
+
+        source = wanted
+        if not wanted.endswith(".monitor"):
+            try:
+                monitor = audiomod.resolve_monitor(wanted)
+            except audiomod.AudioError as exc:
+                raise WFDNotReady(str(exc)) from None
+            if not monitor:
+                raise WFDNotReady(
+                    f"no sink named {wanted!r} -- see `hyprcast ctl list-sinks`")
+            source = monitor
+
+        try:
+            engine.set_audio_device(source)
+        except EngineError as exc:
+            raise WFDNotReady(f"could not switch the audio source: {exc}") from None
+        self.audio_source = source
+        print(f"[hyprcast Media] Audio source    : {source}")
+        return source
 
     def set_output(self, name: str) -> None:
         """Move the capture to another output; the wire size stays frozen, so
@@ -915,6 +1153,144 @@ class NativeSender:
         if engine is None:
             raise WFDNotReady("no media session")
         engine.set_output(name)
+        self.capture_output = name
+        if self._headless is None or name != self._headless.name:
+            self.mode = "mirror"
+
+    # -------------------------------------------------------------- mode switch
+
+    def _real_output_name(self) -> str:
+        """The physical output mirror mode captures, verified to still exist."""
+        live = gather_monitors()
+        if not live:
+            raise WFDNotReady("Hyprland reports no enabled outputs to mirror")
+        ours = self._headless.name if self._headless is not None else ""
+        wanted = self.config.monitor.name if self.config.monitor is not None else ""
+        candidates = [m for m in live if m.name != ours and not m.name.startswith("HEADLESS-")]
+        for monitor in candidates:
+            if monitor.name == wanted:
+                return monitor.name
+        for monitor in candidates:
+            if monitor.focused:
+                return monitor.name
+        if candidates:
+            return candidates[0].name
+        raise WFDNotReady("no physical output left to mirror")
+
+    def set_mode(self, mode: str) -> str:
+        """mirror <-> second-screen, live. Returns the mode now in force.
+
+        THE ORDERING RULE, and the reason this method is longer than it looks
+        like it should be: create the new output first, wait for Hyprland to
+        publish it, move capture onto it, wait for the ENGINE to confirm it has
+        rebuilt, and only then destroy the output we left. Never the reverse.
+        Destroying an output that still has a capture session bound does not
+        return an error -- it takes the compositor down with it, because
+        CScreenshareFrame::transform() dereferences m_session->monitor() with
+        no null check and the frame constructor calls it from Hyprland's own
+        wayland dispatch.
+
+        Nothing renegotiates: the wire size was agreed with the sink at M3 and
+        VPP rescales whatever the new output hands over, so the encoder and the
+        TV never notice the capture moved.
+        """
+        wanted = normalize_mode(mode)
+        with self._mode_lock:
+            engine = self.engine
+            if engine is None:
+                raise WFDNotReady("no media session")
+            if wanted == self.mode:
+                return self.mode
+
+            created: Optional[hypr.HeadlessOutput] = None
+            if wanted == "second-screen":
+                # Exactly the wire mode and the negotiated rate, so the engine
+                # captures at 1:1 and VPP has nothing to scale.
+                created = hypr.HeadlessOutput(
+                    HEADLESS_NAME, self.width, self.height, float(self.config.fps))
+                target = created.name
+            else:
+                target = self._real_output_name()
+
+            try:
+                engine.set_output(target)
+            except EngineError:
+                # The command never reached the engine, so capture is still on
+                # the old output and the new one is safe to remove -- but only
+                # once the engine is actually gone.
+                if created is not None:
+                    if engine.is_alive():
+                        self._retired.append(created)
+                    else:
+                        created.close()
+                raise
+
+            confirmed = engine.sync()
+            retiring, self._headless = self._headless, created
+            self.mode = wanted
+            self.capture_output = target
+            print(f"[hyprcast Media] mode {wanted}: capturing {target}")
+
+        if retiring is not None:
+            if confirmed or not engine.is_alive():
+                try:
+                    retiring.close()
+                except hypr.HyprError as exc:
+                    print(f"[hyprcast Media] could not remove {retiring.name}: {exc}")
+            else:
+                # Unconfirmed means the engine may still hold a capture session
+                # on it. A phantom monitor until the cast ends beats a dead
+                # compositor; stop() removes it once the engine is reaped.
+                print(f"[hyprcast Media] engine did not confirm the switch to "
+                      f"{target}; keeping {retiring.name} until the session ends")
+                with self._mode_lock:
+                    self._retired.append(retiring)
+        return self.mode
+
+    def toggle_mode(self) -> str:
+        return self.set_mode("mirror" if self.mode == "second-screen" else "second-screen")
+
+    # ------------------------------------------------------------------ report
+
+    def snapshot(self) -> dict:
+        """The same shape session.Session.snapshot() returns, so `ctl`,
+        `status` and the waybar module do not care which path is live."""
+        engine = self.engine
+        stats = engine.stats if engine is not None else {}
+        alive = self.is_alive()
+        return {
+            "state": "casting" if alive else "error",
+            "error": "" if alive else (
+                (engine.last_error if engine is not None else "") or "the media leg stopped"),
+            "mode": self.mode,
+            "monitor": self.config.monitor.name if self.config.monitor else "",
+            "capture_output": self.capture_output,
+            "peer": self.tv_ip,
+            "peer_name": self.config.peer_name or "",
+            "width": self.width,
+            "height": self.height,
+            "fps": self.config.fps,
+            "bitrate": self.bitrate_kbits * 1000,
+            "volume": self.volume_pct,
+            "muted": self.muted,
+            # The mode that is actually in force, not the one that was asked
+            # for: a tv-only route that failed to build reports itself as the
+            # shared route it fell back to.
+            "audio_mode": ("none" if self.config.no_audio
+                           else "tv-only" if self._route is not None
+                           else "shared"),
+            "audio_source": self.audio_source,
+            "low_power": self.config.low_power,
+            "duration": round(time.time() - self.started_at, 1) if self.started_at else 0.0,
+            "transport": self.tx_summary(),
+            "stats": {
+                "fps": float(stats.get("fps", 0.0) or 0.0),
+                "kbps": float(stats.get("kbps", 0.0) or 0.0),
+                "cpu": float(stats.get("cpu", 0.0) or 0.0),
+                "drops": int(stats.get("drops", 0) or 0),
+                "idr": int(stats.get("idr", 0) or 0),
+            },
+        }
 
     # ------------------------------------------------------------------ health
 
@@ -2313,6 +2689,78 @@ def _deactivate_connection(active_path: str) -> None:
         print(f"[hyprcast WFD] NetworkManager deactivate warning: {text}")
 
 
+"""
+The tv-only route belongs to the CAST, not to one RTSP session.
+
+A sink that reconnects, or the active probe racing the sink's own connection,
+can leave two NativeSenders alive at once -- measured against the loopback
+harness, two engines, two source ports. Per-sender routes would then fight:
+the second sender's NullSinkRoute() unloads the first one's null sink by name,
+which pulls the audio source out from under a running engine and moves the
+user's streams twice. So there is exactly one route per process, reference
+counted, and the last sender out restores the system.
+"""
+_AUDIO_ROUTE: "Optional[audiomod.NullSinkRoute]" = None
+_AUDIO_ROUTE_REFS = 0
+_AUDIO_ROUTE_LOCK = threading.Lock()
+
+
+def _acquire_audio_route() -> "Optional[audiomod.NullSinkRoute]":
+    """The process-wide tv-only route, built on first use. Raises AudioError."""
+    global _AUDIO_ROUTE, _AUDIO_ROUTE_REFS
+    with _AUDIO_ROUTE_LOCK:
+        if _AUDIO_ROUTE is None:
+            route = audiomod.NullSinkRoute()
+            moved = route.capture_all(set_default=True)
+            print(f"[hyprcast Media] Audio route     : tv-only via "
+                  f"{route.monitor_source} ({moved} stream(s) moved; "
+                  f"{route.previous_default or 'no sink'} restored on stop)")
+            _AUDIO_ROUTE = route
+            _AUDIO_ROUTE_REFS = 0
+        _AUDIO_ROUTE_REFS += 1
+        return _AUDIO_ROUTE
+
+
+def _release_audio_route() -> None:
+    """Drop one reference; the last one restores PipeWire. Never raises."""
+    global _AUDIO_ROUTE, _AUDIO_ROUTE_REFS
+    with _AUDIO_ROUTE_LOCK:
+        if _AUDIO_ROUTE is None:
+            _AUDIO_ROUTE_REFS = 0
+            return
+        _AUDIO_ROUTE_REFS -= 1
+        if _AUDIO_ROUTE_REFS > 0:
+            return
+        route, _AUDIO_ROUTE = _AUDIO_ROUTE, None
+        _AUDIO_ROUTE_REFS = 0
+    try:
+        route.close()
+    except Exception as exc:                       # teardown never raises
+        print(f"[hyprcast Media] audio route restore failed: {exc}")
+    else:
+        print("[hyprcast Media] Audio route restored (laptop playback is back)")
+
+
+def _restore_audio_route() -> None:
+    """Undo any tv-only routing this process left behind.
+
+    Resolves by sink NAME, so it assumes one hyprcast at a time -- which the
+    ctl socket already enforces. Silent when there is nothing to undo.
+    """
+    global _AUDIO_ROUTE, _AUDIO_ROUTE_REFS
+    with _AUDIO_ROUTE_LOCK:
+        route, _AUDIO_ROUTE = _AUDIO_ROUTE, None
+        _AUDIO_ROUTE_REFS = 0
+    if route is not None:
+        try:
+            route.close()
+        except Exception:
+            pass
+    undone = audiomod.recover_route()
+    if undone:
+        print(f"[hyprcast WFD] Audio: {undone}")
+
+
 def _cleanup_step(label: str, action) -> None:
     """Run one teardown step without letting it skip the ones after it.
 
@@ -2883,6 +3331,12 @@ def start_experimental_backend(args) -> None:
             "ext-image-copy-capture-v1."
         )
 
+    # Before anything else: if a previous run was SIGKILLed with tv-only
+    # routing up, the user's speakers are dead RIGHT NOW and every second of
+    # discovery is a second they spend wondering why. Undoing it costs two
+    # pactl calls.
+    _restore_audio_route()
+
     for dead_flag, label in (
         ("wfd_test_pattern", "--wfd-test-pattern"),
         ("wfd_ffmpeg_stats", "--wfd-ffmpeg-stats"),
@@ -2907,10 +3361,15 @@ def start_experimental_backend(args) -> None:
             f"(scale {monitor.scale:g})"
         )
 
+    _STOP_REQUESTED.clear()
+    _set_phase("discovering", peer="", peer_name="",
+               detail=f"scanning {args.wfd_interface}")
     _set_p2p_device_name(args.wfd_interface)
     peer = _scan_and_select(
         args.wfd_interface, getattr(args, "wfd_peer", None), args.wfd_timeout
     )
+    _set_phase("connecting", peer=peer.address, peer_name=peer.name or peer.address,
+               detail="forming the P2P group")
     device_path = _nm_p2p_device_path(args.wfd_interface)
     if not device_path:
         raise WFDNotReady("NetworkManager P2P device disappeared before connection.")
@@ -2932,6 +3391,9 @@ def start_experimental_backend(args) -> None:
         probe_only=bool(getattr(args, "probe_only", False)),
         audio_device=getattr(args, "wfd_audio_device", None),
         no_audio=getattr(args, "wfd_no_audio", False),
+        audio_mode=getattr(args, "wfd_audio_mode", None) or "shared",
+        volume=int(getattr(args, "wfd_volume", None) or 100),
+        muted=bool(getattr(args, "wfd_muted", False)),
         source_port=getattr(args, "wfd_rtp_source_port", 19002),
         latency_log_path=getattr(args, "wfd_latency_log", None),
         peer_name=peer.name,
@@ -3002,6 +3464,8 @@ def start_experimental_backend(args) -> None:
             print("[hyprcast WFD] Waiting for TV RTSP/WFD session. Press Ctrl+C to stop.")
         while True:
             time.sleep(1)
+            if _STOP_REQUESTED.is_set():
+                raise _SessionStop("ctl stop")
             if media_config.probe_only and getattr(rtsp, "probe_done", False):
                 print("[hyprcast WFD] Probe complete; tearing the link down.")
                 break
@@ -3009,10 +3473,16 @@ def start_experimental_backend(args) -> None:
         reason = str(exc) or "Ctrl+C"
         print(f"\n[hyprcast WFD] Stopping WFD session ({reason})...")
     finally:
+        _set_phase("idle", peer="", peer_name="", detail="")
         _restore_stop_handlers(previous_signals)
         if rtsp is not None:
             _cleanup_step("media shutdown", rtsp.stop_all_media)
             _cleanup_step("RTSP server shutdown", rtsp.stop)
+        # stop_all_media() already restored the route through NativeSender.stop().
+        # This is the backstop for the paths that never got that far -- a crash
+        # between loading the null sink and registering the sender, say. It is
+        # idempotent and a no-op when there is nothing to undo.
+        _cleanup_step("audio route restore", _restore_audio_route)
         if firewall_opened:
             _cleanup_step("firewall close", lambda: _close_wfd_firewall_port(rtsp_port))
         if active_path:
