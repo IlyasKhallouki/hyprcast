@@ -1275,6 +1275,81 @@ static void *capture_open_thread(void *arg)
  * running. Killing a working cast because someone typo'd an output name would
  * be a poor trade.
  */
+
+/*
+ * Retiring the OLD capture, off the main loop.
+ *
+ * capture_swap_if_ready() used to call drop_capture() inline. That joins the
+ * old capture thread (which may be mid-hc_capture_wait), destroys a 4-buffer
+ * GBM pool and disconnects a Wayland client -- all while the CFR pacer, which
+ * runs on the same loop, emits nothing. MEASURED on the loopback harness: a
+ * 216 ms PCR gap and a 178 ms PAT gap per switch, even with the NEW capture
+ * already opened in the background.
+ *
+ * On the real sink that gap is fatal rather than untidy: the TV froze on its
+ * last frame and dropped the session about 20 s later. A decoder treats a
+ * timing discontinuity as a fault; it does not simply catch up.
+ *
+ * So the old capture is handed to a detached thread that frees it at its own
+ * pace. The main loop keeps pacing throughout, and the swap costs a few
+ * pointer assignments.
+ */
+struct retiring {
+    struct capthread    ct;
+    struct hc_capture  *cap;
+    struct hc_pool      pool;
+    bool                pool_live;
+    int                 gbm_fd;
+};
+
+static void *retire_thread(void *arg)
+{
+    struct retiring *r = arg;
+
+    cap_join(&r->ct);
+    if (r->pool_live)
+        hc_pool_destroy(&r->pool);
+    if (r->gbm_fd >= 0)
+        close(r->gbm_fd);
+    if (r->cap)
+        hc_capture_close(r->cap);
+    free(r);
+    return NULL;
+}
+
+/* Returns 0 if the old capture was handed off; -1 means the caller must free
+ * it itself (allocation failed), which is still correct, only slower. */
+static int retire_capture_async(struct engine *e)
+{
+    pthread_t tid;
+    struct retiring *r = calloc(1, sizeof *r);
+
+    if (!r)
+        return -1;
+
+    r->ct        = e->ct;
+    r->cap       = e->cap;
+    r->pool      = e->pool;
+    r->pool_live = e->pool_live;
+    r->gbm_fd    = e->gbm_fd;
+
+    /* The capture thread was handed &e->pool at cap_start; the pool has moved
+     * into the bundle, so re-point it before the thread touches it again. */
+    r->ct.pool = &r->pool;
+
+    if (pthread_create(&tid, NULL, retire_thread, r) != 0) {
+        free(r);
+        return -1;
+    }
+    pthread_detach(tid);
+
+    memset(&e->ct, 0, sizeof e->ct);
+    e->cap       = NULL;
+    e->pool_live = false;
+    e->gbm_fd    = -1;
+    return 0;
+}
+
 static void capture_swap_if_ready(struct engine *e)
 {
     if (!e->cap_switching ||
@@ -1292,7 +1367,13 @@ static void capture_swap_if_ready(struct engine *e)
         return;
     }
 
-    drop_capture(e);                    /* only now is the old one released */
+    /* Hand the old capture to a reaper instead of freeing it here: the pacer
+     * runs on this loop and every millisecond spent in drop_capture() is a
+     * millisecond the sink gets no packets. */
+    if (retire_capture_async(e) != 0) {
+        HC_LOG("could not spawn the capture reaper; freeing inline");
+        drop_capture(e);
+    }
 
     e->cap       = e->cap_pending;
     e->pool      = e->pool_pending;

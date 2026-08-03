@@ -480,6 +480,7 @@ def switch(pipeline, target_mode: str, cfg: "ExtendConfig | None" = None) -> str
 def _to_extend(pipeline, cfg: "ExtendConfig") -> str:
     """create -> confirm it exists -> set_output -> confirm -> move workspace."""
     global _mode, _capture, _home
+    _cancel_linger()   # do not let a pending removal fire onto the new output
     new = ensure_extend(cfg.width, cfg.height, cfg.refresh, cfg.name, cfg.position)
     fallback = _mirror_output(pipeline, cfg, exclude=new) or _capture
 
@@ -519,6 +520,64 @@ def _to_extend(pipeline, cfg: "ExtendConfig") -> str:
     return new
 
 
+
+# How long a headless output lingers after capture has moved off it.
+#
+# MEASURED ON THE REAL SINK, not on loopback: destroying the output the instant
+# the capture switch confirms froze the TV on its last frame and the session
+# died ~20 s later. Removing a monitor makes Hyprland reconfigure, which stalls
+# compositing for a couple of hundred milliseconds -- exactly when the sink is
+# trying to resync on the post-switch IDR. A decoder treats that as a timing
+# fault and gives up. On loopback the same gap only tripped assert-ts's PAT/PMT
+# and PCR checks, which is why it looked cosmetic.
+#
+# So the output is kept alive until the sink has settled, then removed. It is
+# already empty and unfocused by then; it costs nothing but a phantom monitor
+# for a few seconds.
+_LINGER = 4.0
+_linger_timer: "threading.Timer | None" = None
+
+
+def _cancel_linger() -> None:
+    global _linger_timer
+    timer, _linger_timer = _linger_timer, None
+    if timer is not None:
+        timer.cancel()
+
+
+def _teardown_later(name: str, delay: float = _LINGER) -> None:
+    """Remove `name` once the sink has had time to resync. Never blocks."""
+    global _linger_timer
+    _cancel_linger()
+
+    def _fire() -> None:
+        global _linger_timer
+        _linger_timer = None
+        try:
+            teardown_extend(name)
+        except Exception as exc:                      # never kill the timer thread
+            _log(f"deferred teardown of {name} failed: {type(exc).__name__}: {exc}")
+
+    _log(f"{name} is free; removing it in {delay:g}s so the sink can resync first")
+    timer = threading.Timer(delay, _fire)
+    timer.daemon = True
+    _linger_timer = timer
+    timer.start()
+
+
+def flush_linger() -> None:
+    """Run any pending deferred teardown now. Safe to call repeatedly."""
+    global _linger_timer
+    timer, _linger_timer = _linger_timer, None
+    if timer is None:
+        return
+    timer.cancel()
+    try:
+        teardown_extend()
+    except Exception as exc:
+        _log(f"flushing deferred teardown failed: {type(exc).__name__}: {exc}")
+
+
 def _to_mirror(pipeline, cfg: "ExtendConfig") -> str:
     """set_output(real) -> confirm -> move workspaces back -> THEN destroy."""
     global _mode, _capture, _home, _pipeline
@@ -532,7 +591,7 @@ def _to_mirror(pipeline, cfg: "ExtendConfig") -> str:
 
     _mode, _capture, _home = "mirror", target, target
     if old:
-        teardown_extend(old)
+        _teardown_later(old)
     _pipeline = None
     _log(f"mirror: capturing {target}")
     return target
@@ -582,10 +641,13 @@ def release(pipeline=None) -> str:
         target = pipeline if pipeline is not None else _pipeline
         if _headless and _engine_alive(target):
             try:
-                return _to_mirror(target, ExtendConfig())
+                out = _to_mirror(target, ExtendConfig())
+                flush_linger()      # the session is ending; do not linger
+                return out
             except ModeError as exc:
                 _log(f"leaving {_headless} in place: {exc}")
                 return _capture
+        _cancel_linger()
         teardown_extend()
         return _capture
     except Exception as exc:
