@@ -393,6 +393,17 @@ static bool cap_take(struct capthread *ct, int *idx, uint64_t *pres,
     return got;
 }
 
+/* True once the thread has a frame waiting. Does NOT consume it. */
+static bool cap_has_frame(struct capthread *ct)
+{
+    bool got;
+
+    pthread_mutex_lock(&ct->mu);
+    got = ct->have_frame;
+    pthread_mutex_unlock(&ct->mu);
+    return got;
+}
+
 static void cap_put(struct capthread *ct, int idx)
 {
     if (idx < 0)
@@ -484,10 +495,13 @@ struct engine {
     _Atomic bool       cap_pending_done;
     char               cap_pending_name[64];
     struct hc_capture *cap_pending;
+    struct capthread   ct_pending;
+    bool               ct_pending_live;
     struct hc_pool     pool_pending;
     bool               pool_pending_live;
     int                gbm_fd_pending;
     int                cap_pending_rc;
+    uint64_t           cap_switch_deadline_ns;
     bool     ready_sent;
 
     uint64_t pts_ring[HC_PTS_RING];
@@ -779,6 +793,10 @@ static void session_stop(struct engine *e)
         pthread_join(e->cap_open_tid, NULL);
         e->cap_switching = false;
         if (e->cap_pending_rc == 0 && e->cap_pending) {
+            if (e->ct_pending_live) {
+                cap_join(&e->ct_pending);
+                e->ct_pending_live = false;
+            }
             if (e->pool_pending_live) {
                 hc_pool_destroy(&e->pool_pending);
                 e->pool_pending_live = false;
@@ -1256,7 +1274,22 @@ static void *capture_open_thread(void *arg)
     if (e->cap_pending) {
         if (build_pool_into(e, e->cap_pending, &e->pool_pending,
                             &e->pool_pending_live, &e->gbm_fd_pending) == 0) {
-            e->cap_pending_rc = 0;
+            /*
+             * Start capturing NOW, while the old capture is still feeding the
+             * pacer. The swap then waits for this thread to have a frame in
+             * hand, so hold_idx is never left pointing at nothing.
+             */
+            if (cap_start(&e->ct_pending, e->cap_pending, &e->pool_pending) == 0) {
+                e->ct_pending_live = true;
+                e->cap_pending_rc  = 0;
+            } else {
+                hc_pool_destroy(&e->pool_pending);
+                e->pool_pending_live = false;
+                close(e->gbm_fd_pending);
+                e->gbm_fd_pending = -1;
+                hc_capture_close(e->cap_pending);
+                e->cap_pending = NULL;
+            }
         } else {
             hc_capture_close(e->cap_pending);
             e->cap_pending = NULL;
@@ -1356,6 +1389,30 @@ static void capture_swap_if_ready(struct engine *e)
         !atomic_load_explicit(&e->cap_pending_done, memory_order_acquire))
         return;
 
+    /*
+     * The opener is finished, but do NOT swap until the new capture actually
+     * has a frame. The pacer can only repeat e->hold_idx, which indexes the
+     * CURRENT pool; swapping first leaves hold_idx = -1 and the pacer emits
+     * nothing at all -- no video, no PAT, no PMT, no PCR -- until the new
+     * output happens to produce something.
+     *
+     * That is fatal in extend mode. A fresh headless output is a static black
+     * desktop, capture is damage driven, and Hyprland only forces a copy after
+     * ~550 ms of silence. MEASURED ON THE REAL SINK: the TV froze on its last
+     * frame and dropped the session ~20 s later. Loopback tests missed it
+     * because a scrolling terminal kept generating damage.
+     *
+     * So the old capture keeps feeding the pacer until the new one is proven
+     * live, and only then do the pointers move.
+     */
+    if (e->cap_pending_rc == 0 && e->ct_pending_live &&
+        !cap_has_frame(&e->ct_pending)) {
+        if (hc_now_ns() < e->cap_switch_deadline_ns)
+            return;                     /* still warming up; try again next tick */
+        HC_LOG("output: '%s' produced no frame in time; swapping anyway",
+               e->cap_pending_name[0] ? e->cap_pending_name : "<first output>");
+    }
+
     pthread_join(e->cap_open_tid, NULL);
     e->cap_switching = false;
     atomic_store_explicit(&e->cap_pending_done, false, memory_order_release);
@@ -1387,11 +1444,12 @@ static void capture_swap_if_ready(struct engine *e)
      * pool moved, so re-point it before a frame is attached to a stale one. */
     hc_capture_set_pool(e->cap, &e->pool);
 
-    if (cap_start(&e->ct, e->cap, &e->pool) != 0) {
-        ev_error(e, "could not start the capture thread after switching output");
-        session_stop(e);
-        return;
-    }
+    /* The capture thread is already running against this pool, started by the
+     * opener; adopt it rather than starting a second one. */
+    e->ct = e->ct_pending;
+    e->ct.pool = &e->pool;
+    e->ct_pending_live = false;
+    memset(&e->ct_pending, 0, sizeof e->ct_pending);
 
     snprintf(e->output, sizeof e->output, "%s", e->cap_pending_name);
     e->hold_idx  = -1;
@@ -1428,6 +1486,8 @@ static void cmd_output(struct engine *e, const struct hc_ctl_msg *m)
         return;
     }
     e->cap_switching = true;
+    /* Wait this long for the new output's first frame before swapping blind. */
+    e->cap_switch_deadline_ns = hc_now_ns() + 1500ull * 1000000ull;
     /* The wire size is frozen, so VPP absorbs the new capture geometry and the
      * encoder never notices the change when the swap lands. */
 }
