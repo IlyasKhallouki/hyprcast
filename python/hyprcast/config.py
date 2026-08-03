@@ -113,7 +113,7 @@ SPEC: dict[str, dict[str, Field]] = {
         "bitrate":     Field("bitrate", "8M"),
         "mode":        Field("str", "mirror", choices=("mirror", "extend")),
         "monitor":     Field("str", ""),
-        "audio":       Field("str", "shared", choices=("shared", "tv-only", "none")),
+        "audio":       Field("str", "shared", choices=("shared", "tv-only", "device", "none")),
         # Cast volume only. 100 is unity -- what the sink hears equals what the
         # monitor source carries -- and it never touches the laptop's own sink.
         "volume":      Field("int", 100, lo=0, hi=100),
@@ -310,7 +310,7 @@ fps = 60
 bitrate = "8M"
 mode = "mirror"          # mirror | extend
 monitor = ""             # "" = the first output
-audio = "shared"         # shared | tv-only | none
+audio = "device"         # shared | tv-only | none
 volume = 100             # cast volume; 100 is unity, and the laptop's own
                          # sink volume is never touched
 low_power = false

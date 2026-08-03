@@ -864,6 +864,28 @@ class NativeSender:
             self.audio_source = self.config.audio_device
             return self.audio_source
 
+        if self.config.audio_mode == "device":
+            # The HDMI model. A `hyprcast` sink appears among the output
+            # devices and the engine captures its monitor, but the default sink
+            # is left alone and no existing stream is moved. Send an app to the
+            # TV the same way you would send it to an HDMI monitor: pick the
+            # output in pavucontrol, or `pactl move-sink-input <id> hyprcast`.
+            #
+            # tv-only takes the whole desktop's sound; this takes only what you
+            # point at it.
+            try:
+                route = _acquire_audio_route(set_default=False)
+            except audiomod.AudioError as exc:
+                print(f"[hyprcast Media] device routing failed ({exc}); "
+                      f"falling back to shared audio")
+                self.audio_source = _detect_audio_monitor() or ""
+                return self.audio_source
+            self._route = route
+            self.audio_source = route.monitor_source
+            print("[hyprcast Media] Audio device    : send apps to the "
+                  "'hyprcast' output to hear them on the TV")
+            return self.audio_source
+
         if self.config.audio_mode == "tv-only":
             try:
                 route = _acquire_audio_route()
@@ -2710,16 +2732,24 @@ _AUDIO_ROUTE_REFS = 0
 _AUDIO_ROUTE_LOCK = threading.Lock()
 
 
-def _acquire_audio_route() -> "Optional[audiomod.NullSinkRoute]":
-    """The process-wide tv-only route, built on first use. Raises AudioError."""
+def _acquire_audio_route(set_default: bool = True) -> "Optional[audiomod.NullSinkRoute]":
+    """The process-wide null-sink route, built on first use. Raises AudioError.
+
+    set_default=False builds the sink without taking over playback, which is
+    what audio="device" wants: the TV becomes selectable rather than mandatory.
+    """
     global _AUDIO_ROUTE, _AUDIO_ROUTE_REFS
     with _AUDIO_ROUTE_LOCK:
         if _AUDIO_ROUTE is None:
             route = audiomod.NullSinkRoute()
-            moved = route.capture_all(set_default=True)
-            print(f"[hyprcast Media] Audio route     : tv-only via "
-                  f"{route.monitor_source} ({moved} stream(s) moved; "
-                  f"{route.previous_default or 'no sink'} restored on stop)")
+            if set_default:
+                moved = route.capture_all(set_default=True)
+                print(f"[hyprcast Media] Audio route     : tv-only via "
+                      f"{route.monitor_source} ({moved} stream(s) moved; "
+                      f"{route.previous_default or 'no sink'} restored on stop)")
+            else:
+                print(f"[hyprcast Media] Audio route     : device via "
+                      f"{route.monitor_source} (default sink untouched)")
             _AUDIO_ROUTE = route
             _AUDIO_ROUTE_REFS = 0
         _AUDIO_ROUTE_REFS += 1

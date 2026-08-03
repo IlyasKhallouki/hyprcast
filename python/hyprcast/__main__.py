@@ -746,7 +746,7 @@ def _config_flags() -> argparse.ArgumentParser:
     p.add_argument("--bitrate", default=None, help="e.g. 8M, 6000k")
     p.add_argument("--width", type=int, default=None)
     p.add_argument("--height", type=int, default=None)
-    p.add_argument("--audio", choices=("shared", "tv-only", "none"), default=None,
+    p.add_argument("--audio", choices=("shared", "tv-only", "device", "none"), default=None,
                    help="tv-only routes playback through a null sink so the "
                         "laptop speakers stay silent")
     p.add_argument("--volume", type=int, default=None, metavar="0-100",
