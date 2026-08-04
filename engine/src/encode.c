@@ -241,6 +241,41 @@ struct hc_enc *hc_enc_open(struct hc_va *v, const struct hc_enc_cfg *cfg)
      * quality=1 is SLOWER on both paths (3.84 / 3.01 ms), so "best quality"
      * is the wrong instinct here.
      */
+    /*
+     * Cap the keyframe burst.
+     *
+     * MEASURED on a real desktop at 720p60, 8 Mbit/s: mean access unit 15,332
+     * bytes, max 164,142. Once a second the encoder emits a frame 10.7x the
+     * average, and pushing 164 KB into one 16.67 ms slot is ~79 Mbit/s
+     * instantaneous. A Wi-Fi Direct link already time-slicing with the STA
+     * connection drops packets under that, and losing part of an IDR corrupts
+     * the picture until the NEXT one a full second later. That is the periodic
+     * stutter.
+     *
+     * h264_vaapi honours max_frame_size on Gen9.5. The multiplier matters a
+     * great deal and 2.5x was measurably wrong -- it throttles the whole
+     * stream, not just the keyframe. Measured against identical motion,
+     * 720p60 at an 8 Mbit/s target:
+     *
+     *   cap off    7.796 Mbit/s  max 170,486  mean 15,387   (11.1x spike)
+     *   cap 3.6x   7.635 Mbit/s  max  55,910  mean 15,062   (3.7x, quality kept)
+     *   cap 2.5x   1.957 Mbit/s  max  41,384  mean  3,493   (75% of the bitrate lost)
+     *
+     * So 3.5x: it removes the burst that overruns the Wi-Fi queue while the
+     * encoder still spends its full budget. HC_MAX_FRAME_SIZE overrides,
+     * 0 disables the cap.
+     */
+    {
+        const char *mfs = getenv("HC_MAX_FRAME_SIZE");
+        long cap = mfs ? strtol(mfs, NULL, 10)
+                       : (long)((double)cfg->bitrate_bps / cfg->fps / 8.0 * 3.5);
+        if (cap > 0) {
+            if (set_opt_int(e, "max_frame_size", cap) < 0) goto fail;
+            HC_LOG("keyframe cap: %ld bytes (%.1fx the average frame)",
+                   cap, cap / ((double)cfg->bitrate_bps / cfg->fps / 8.0));
+        }
+    }
+
     {
         const char *q = getenv("HC_QUALITY");
         int quality = q ? atoi(q) : (cfg->low_power ? 7 : 4);
